@@ -10,6 +10,24 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  wasm:
+    name: WASM compatibility
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.92.0
+          targets: wasm32-unknown-unknown
+
+      - name: Check torii-core for WASM
+        run: cargo check -p torii-core --target wasm32-unknown-unknown --no-default-features --features wasm
+
+      - name: Check torii-client for WASM
+        run: cargo check -p torii-client --target wasm32-unknown-unknown --no-default-features --features wasm
+
   build:
     services:
       postgres:

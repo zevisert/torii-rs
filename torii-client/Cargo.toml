@@ -1,0 +1,21 @@
+[package]
+name = "torii-client"
+version = "0.5.2"
+description = "Transport-neutral HTTP contracts for Torii authentication clients"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait = "0.1"
+chrono.workspace = true
+serde.workspace = true
+torii-core = { path = "../torii-core", version = "0.5.2", default-features = false }
+
+[features]
+default = []
+wasm = ["torii-core/wasm"]
+
+[dev-dependencies]
+serde_json.workspace = true
+tokio.workspace = true

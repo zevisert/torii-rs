@@ -81,7 +81,7 @@ pub use extractors::{
     SessionTokenFromRequest,
 };
 pub use middleware::{HasTorii, auth_middleware, require_auth};
-pub use routes::create_router;
+pub use routes::{create_router, login_handler};
 pub use types::{
     AuthResponse, ChangePasswordRequest, ConnectionInfo, CookieConfig, CookieSameSite,
     HealthResponse, LinkConfig, LoginRequest, MagicLinkRequest, MagicLinkResponse, MessageResponse,

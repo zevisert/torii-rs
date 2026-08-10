@@ -1,9 +1,9 @@
-use crate::{
+use crate::services::UserService;
+use std::sync::Arc;
+use torii_core::{
     Error, User, UserId,
     repositories::{PasskeyCredential, PasskeyRepository, UserRepository},
-    services::UserService,
 };
-use std::sync::Arc;
 
 /// Service for passkey/WebAuthn authentication operations
 pub struct PasskeyService<U: UserRepository, P: PasskeyRepository> {
@@ -94,13 +94,13 @@ impl<U: UserRepository, P: PasskeyRepository> PasskeyService<U, P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repositories::{PasskeyCredential, PasskeyRepository, UserRepository};
-    use crate::{User, UserId};
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
+    use torii_core::repositories::{PasskeyCredential, PasskeyRepository, UserRepository};
+    use torii_core::{User, UserId};
 
     // Mock implementations for testing
     #[derive(Debug, Clone)]
@@ -133,7 +133,7 @@ mod tests {
 
     #[async_trait]
     impl UserRepository for MockUserRepository {
-        async fn create(&self, new_user: crate::storage::NewUser) -> Result<User, Error> {
+        async fn create(&self, new_user: torii_core::storage::NewUser) -> Result<User, Error> {
             let user = MockUser {
                 id: UserId::new_random(),
                 email: new_user.email,
@@ -168,7 +168,7 @@ mod tests {
             if let Some(user) = self.find_by_email(email).await? {
                 Ok(user)
             } else {
-                let new_user = crate::storage::NewUser::builder()
+                let new_user = torii_core::storage::NewUser::builder()
                     .email(email.to_string())
                     .build()
                     .unwrap();
@@ -382,7 +382,7 @@ mod tests {
         let public_key = vec![5, 6, 7, 8];
 
         // First create a user and register a credential
-        let new_user = crate::storage::NewUser::builder()
+        let new_user = torii_core::storage::NewUser::builder()
             .email("test@example.com".to_string())
             .build()
             .unwrap();

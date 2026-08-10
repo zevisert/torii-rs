@@ -46,6 +46,7 @@ transport.send_email(email).await?;
 Configure the mailer using environment variables:
 
 ### SMTP Transport
+
 ```bash
 MAILER_SMTP_HOST=smtp.gmail.com
 MAILER_SMTP_PORT=587
@@ -55,17 +56,20 @@ MAILER_SMTP_TLS=starttls  # none, starttls, tls
 ```
 
 ### File Transport (Development)
+
 ```bash
 MAILER_FILE_OUTPUT_DIR=./emails
 ```
 
 ### Sendmail Transport
+
 ```bash
 MAILER_SENDMAIL=true
 MAILER_SENDMAIL_COMMAND=/usr/sbin/sendmail  # optional
 ```
 
 ### Common Settings
+
 ```bash
 MAILER_FROM_ADDRESS=noreply@myapp.com
 MAILER_FROM_NAME="My App"
@@ -119,7 +123,7 @@ You can then open the `.eml` files in your email client to preview the emails.
 The mailer integrates seamlessly with torii-core services:
 
 ```rust
-use torii_core::services::MagicLinkService;
+use torii_services::MagicLinkService;
 use torii_mailer::prelude::*;
 
 // In your magic link service

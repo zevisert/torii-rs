@@ -3,8 +3,8 @@ pub use self::mailer_impl::*;
 
 #[cfg(feature = "mailer")]
 mod mailer_impl {
-    use crate::Error;
     use async_trait::async_trait;
+    use torii_core::Error;
     use torii_mailer::prelude::*;
 
     #[async_trait]
@@ -48,7 +48,7 @@ mod mailer_impl {
     impl ToriiMailerService {
         pub fn new(config: MailerConfig) -> Result<Self, Error> {
             let transport = config.build_transport().map_err(|e| {
-                Error::Storage(crate::error::StorageError::Connection(e.to_string()))
+                Error::Storage(torii_core::error::StorageError::Connection(e.to_string()))
             })?;
             let engine = AskamaTemplateEngine::new();
 
@@ -61,7 +61,7 @@ mod mailer_impl {
 
         pub fn from_env() -> Result<Self, Error> {
             let config = MailerConfig::from_env().map_err(|e| {
-                Error::Storage(crate::error::StorageError::Connection(e.to_string()))
+                Error::Storage(torii_core::error::StorageError::Connection(e.to_string()))
             })?;
             Self::new(config)
         }
@@ -98,10 +98,12 @@ mod mailer_impl {
                 context,
             )
             .await
-            .map_err(|e| Error::Storage(crate::error::StorageError::Connection(e.to_string())))?;
+            .map_err(|e| {
+                Error::Storage(torii_core::error::StorageError::Connection(e.to_string()))
+            })?;
 
             self.transport.send_email(email).await.map_err(|e| {
-                Error::Storage(crate::error::StorageError::Connection(e.to_string()))
+                Error::Storage(torii_core::error::StorageError::Connection(e.to_string()))
             })?;
 
             Ok(())
@@ -114,11 +116,11 @@ mod mailer_impl {
                 WelcomeEmail::build(&self.engine, &self.config.get_from_address(), to, context)
                     .await
                     .map_err(|e| {
-                        Error::Storage(crate::error::StorageError::Connection(e.to_string()))
+                        Error::Storage(torii_core::error::StorageError::Connection(e.to_string()))
                     })?;
 
             self.transport.send_email(email).await.map_err(|e| {
-                Error::Storage(crate::error::StorageError::Connection(e.to_string()))
+                Error::Storage(torii_core::error::StorageError::Connection(e.to_string()))
             })?;
 
             Ok(())
@@ -140,10 +142,12 @@ mod mailer_impl {
                 context,
             )
             .await
-            .map_err(|e| Error::Storage(crate::error::StorageError::Connection(e.to_string())))?;
+            .map_err(|e| {
+                Error::Storage(torii_core::error::StorageError::Connection(e.to_string()))
+            })?;
 
             self.transport.send_email(email).await.map_err(|e| {
-                Error::Storage(crate::error::StorageError::Connection(e.to_string()))
+                Error::Storage(torii_core::error::StorageError::Connection(e.to_string()))
             })?;
 
             Ok(())
@@ -163,10 +167,12 @@ mod mailer_impl {
                 context,
             )
             .await
-            .map_err(|e| Error::Storage(crate::error::StorageError::Connection(e.to_string())))?;
+            .map_err(|e| {
+                Error::Storage(torii_core::error::StorageError::Connection(e.to_string()))
+            })?;
 
             self.transport.send_email(email).await.map_err(|e| {
-                Error::Storage(crate::error::StorageError::Connection(e.to_string()))
+                Error::Storage(torii_core::error::StorageError::Connection(e.to_string()))
             })?;
 
             Ok(())
@@ -188,10 +194,12 @@ mod mailer_impl {
                 context,
             )
             .await
-            .map_err(|e| Error::Storage(crate::error::StorageError::Connection(e.to_string())))?;
+            .map_err(|e| {
+                Error::Storage(torii_core::error::StorageError::Connection(e.to_string()))
+            })?;
 
             self.transport.send_email(email).await.map_err(|e| {
-                Error::Storage(crate::error::StorageError::Connection(e.to_string()))
+                Error::Storage(torii_core::error::StorageError::Connection(e.to_string()))
             })?;
 
             Ok(())

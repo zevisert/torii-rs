@@ -1,11 +1,11 @@
-use crate::{
+use crate::services::UserService;
+use std::sync::Arc;
+use torii_core::{
     Error, User, UserId,
     error::AuthError,
     repositories::{PasswordRepository, UserRepository},
-    services::UserService,
     validation::validate_password,
 };
-use std::sync::Arc;
 
 /// Service for password authentication operations
 pub struct PasswordService<U: UserRepository, P: PasswordRepository> {
@@ -160,14 +160,14 @@ impl<U: UserRepository, P: PasswordRepository> PasswordService<U, P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::ValidationError;
-    use crate::repositories::{PasswordRepository, UserRepository};
-    use crate::storage::NewUser;
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
+    use torii_core::error::ValidationError;
+    use torii_core::repositories::{PasswordRepository, UserRepository};
+    use torii_core::storage::NewUser;
 
     // Mock implementations for testing
     #[derive(Debug, Clone)]

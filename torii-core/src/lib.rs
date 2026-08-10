@@ -13,7 +13,6 @@ pub mod error;
 pub mod events;
 pub mod id;
 pub mod repositories;
-pub mod services;
 pub mod session;
 pub mod storage;
 pub mod user;
@@ -22,16 +21,9 @@ pub mod validation;
 pub use error::Error;
 pub use events::UnlockReason;
 pub use repositories::RepositoryProvider;
-pub use services::{
-    BruteForceProtectionService, EmailVerificationService, MagicLinkService, OAuthService,
-    PasskeyService, PasswordResetService, PasswordService, SessionService, UserService,
-};
-#[cfg(feature = "mailer")]
-pub use services::{MailerService, ToriiMailerService};
-pub use session::{
-    JwtAlgorithm, JwtClaims, JwtConfig, JwtMetadata, JwtSessionProvider, OpaqueSessionProvider,
-    Session, SessionProvider, SessionToken,
-};
+#[cfg(feature = "jwt")]
+pub use session::{JwtAlgorithm, JwtClaims, JwtConfig, JwtMetadata, JwtSessionProvider};
+pub use session::{OpaqueSessionProvider, Session, SessionProvider, SessionToken};
 pub use storage::{
     AttemptStats, BruteForceProtectionConfig, FailedLoginAttempt, LockoutStatus, NewUser,
     SecureToken, TokenPurpose,

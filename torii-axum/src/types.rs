@@ -1,91 +1,4 @@
-use serde::{Deserialize, Serialize};
-use torii::{Session, User};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegisterRequest {
-    pub email: String,
-    pub password: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LoginRequest {
-    pub email: String,
-    pub password: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChangePasswordRequest {
-    pub old_password: String,
-    pub new_password: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MagicLinkRequest {
-    pub email: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VerifyMagicTokenRequest {
-    pub token: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PasswordResetRequest {
-    pub email: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VerifyResetTokenRequest {
-    pub token: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResetPasswordRequest {
-    pub token: String,
-    pub new_password: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct AuthResponse {
-    pub user: User,
-    pub session: Session,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct UserResponse {
-    pub user: User,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SessionResponse {
-    pub session: Session,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct MessageResponse {
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct MagicLinkResponse {
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct PasswordResetResponse {
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct VerifyResetTokenResponse {
-    pub valid: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct HealthResponse {
-    pub status: String,
-    pub version: String,
-}
+pub use torii_client::*;
 
 #[derive(Debug, Clone)]
 pub struct ConnectionInfo {
@@ -178,9 +91,10 @@ impl LinkConfig {
     /// Returns a URL in the format: `{hostname}{path_prefix}/magic-link/verify?token={token}`
     pub fn magic_link_url(&self, token: &str) -> String {
         format!(
-            "{}{}/magic-link/verify?token={}",
+            "{}{}{}?token={}",
             self.hostname.trim_end_matches('/'),
             self.path_prefix,
+            torii_client::path::MAGIC_LINK_VERIFY,
             token
         )
     }
@@ -190,9 +104,10 @@ impl LinkConfig {
     /// Returns a URL in the format: `{hostname}{path_prefix}/password/reset?token={token}`
     pub fn password_reset_url(&self, token: &str) -> String {
         format!(
-            "{}{}/password/reset?token={}",
+            "{}{}{}?token={}",
             self.hostname.trim_end_matches('/'),
             self.path_prefix,
+            torii_client::path::PASSWORD_RESET,
             token
         )
     }

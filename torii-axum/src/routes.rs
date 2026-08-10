@@ -62,13 +62,16 @@ where
     let state = torii;
 
     let public_routes = Router::new()
-        .route("/health", get(health_handler))
-        .route("/session", get(get_session_handler))
-        .route("/user", get(get_user_handler));
+        .route(torii_client::path::HEALTH, get(health_handler))
+        .route(torii_client::path::SESSION, get(get_session_handler))
+        .route(torii_client::path::USER, get(get_user_handler));
 
     let auth_routes = Router::new()
-        .route("/logout", post(logout_handler).delete(logout_handler))
-        .route("/session", delete(logout_handler));
+        .route(
+            torii_client::path::LOGOUT,
+            post(logout_handler).delete(logout_handler),
+        )
+        .route(torii_client::path::SESSION, delete(logout_handler));
 
     #[allow(unused_mut)]
     let mut router = Router::new().merge(public_routes).merge(auth_routes).layer(
@@ -171,9 +174,12 @@ where
     R: RepositoryProvider + 'static,
 {
     Router::new()
-        .route("/register", post(register_handler))
-        .route("/login", post(login_handler))
-        .route("/password", post(change_password_handler))
+        .route(torii_client::path::REGISTER, post(register_handler))
+        .route(torii_client::path::LOGIN, post(login_handler))
+        .route(
+            torii_client::path::CHANGE_PASSWORD,
+            post(change_password_handler),
+        )
 }
 
 #[cfg(feature = "password")]
@@ -221,7 +227,7 @@ where
 }
 
 #[cfg(feature = "password")]
-async fn login_handler<R>(
+pub async fn login_handler<R>(
     State(state): State<Arc<Torii<R>>>,
     axum::Extension(cookie_config): axum::Extension<CookieConfig>,
     connection_info: ConnectionInfo,
@@ -265,11 +271,17 @@ where
 {
     Router::new()
         .route(
-            "/password/reset/request",
+            torii_client::path::PASSWORD_RESET_REQUEST,
             post(request_password_reset_handler),
         )
-        .route("/password/reset/verify", post(verify_reset_token_handler))
-        .route("/password/reset/confirm", post(reset_password_handler))
+        .route(
+            torii_client::path::PASSWORD_RESET_VERIFY,
+            post(verify_reset_token_handler),
+        )
+        .route(
+            torii_client::path::PASSWORD_RESET_CONFIRM,
+            post(reset_password_handler),
+        )
 }
 
 #[cfg(any(feature = "password", feature = "magic-link"))]
@@ -284,9 +296,10 @@ where
     // Generate a temporary token to build the URL
     // The actual token will be generated and sent by reset_password_initiate
     let reset_url_base = format!(
-        "{}{}/password/reset",
+        "{}{}{}",
         link_config.hostname.trim_end_matches('/'),
-        link_config.path_prefix
+        link_config.path_prefix,
+        torii_client::path::PASSWORD_RESET
     );
 
     state
@@ -361,8 +374,14 @@ where
     R: RepositoryProvider + 'static,
 {
     Router::new()
-        .route("/magic-link", post(request_magic_link_handler))
-        .route("/magic-link/verify", post(verify_magic_link_handler))
+        .route(
+            torii_client::path::MAGIC_LINK,
+            post(request_magic_link_handler),
+        )
+        .route(
+            torii_client::path::MAGIC_LINK_VERIFY,
+            post(verify_magic_link_handler),
+        )
 }
 
 #[cfg(feature = "magic-link")]
@@ -376,9 +395,10 @@ where
 {
     // Build the base URL for the magic link (without the token)
     let magic_link_url_base = format!(
-        "{}{}/magic-link/verify",
+        "{}{}{}",
         link_config.hostname.trim_end_matches('/'),
-        link_config.path_prefix
+        link_config.path_prefix,
+        torii_client::path::MAGIC_LINK_VERIFY
     );
 
     // send_link generates the token and sends the email via the configured mailer

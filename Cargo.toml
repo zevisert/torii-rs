@@ -7,8 +7,10 @@ members = [
 
     # Level 2: Core (no internal dependencies)
     "torii-core",
+    "torii-client",
 
-    # Level 3: Migration (depends on torii-core)
+    # Level 3: Services and Migration (depends on torii-core)
+    "torii-services",
     "torii-migration",
 
     # Level 4: Storage backends (depend on torii-core and torii-migration)
@@ -50,4 +52,9 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 uuid = { version = "1", features = ["v4"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "chrono", "uuid"] }
-sea-orm = { version = "1.1.13", features = ["runtime-tokio-rustls", "macros", "with-chrono", "with-uuid"] }
+sea-orm = { version = "1.1.13", features = [
+    "runtime-tokio-rustls",
+    "macros",
+    "with-chrono",
+    "with-uuid",
+] }

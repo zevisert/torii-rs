@@ -10,7 +10,8 @@ license.workspace = true
 all-features = true # build docs with all features enabled
 
 [dependencies]
-torii-core = { path = "../torii-core", version = "0.5.2", default-features = false }
+torii-core = { path = "../torii-core", version = "0.5.2", default-features = false, features = ["jwt"] }
+torii-services = { path = "../torii-services", version = "0.5.2", default-features = false }
 torii-storage-sqlite = { path = "../torii-storage-sqlite", version = "0.5.2", optional = true }
 torii-storage-postgres = { path = "../torii-storage-postgres", version = "0.5.2", optional = true }
 torii-storage-seaorm = { path = "../torii-storage-seaorm", version = "0.5.2", optional = true }
@@ -63,4 +64,4 @@ passkey = []
 magic-link = []
 
 # mailer feature
-mailer = ["dep:torii-mailer", "torii-core/mailer"]
+mailer = ["dep:torii-mailer", "torii-core/mailer", "torii-services/mailer"]

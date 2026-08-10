@@ -122,14 +122,13 @@ use std::sync::Arc;
 
 use chrono::{Duration, Utc};
 use torii_core::{
-    BruteForceProtectionService, JwtSessionProvider, OpaqueSessionProvider, RepositoryProvider,
-    SessionProvider,
+    JwtSessionProvider, OpaqueSessionProvider, RepositoryProvider, SessionProvider,
     repositories::{
         BruteForceProtectionRepositoryAdapter, PasswordRepositoryAdapter, SessionRepositoryAdapter,
         TokenRepositoryAdapter, UserRepositoryAdapter,
     },
-    services::{SessionService, UserService},
 };
+use torii_services::{BruteForceProtectionService, SessionService, UserService};
 
 // Re-export builder types
 pub use builder::{NoStorage, ToriiBuilder, ToriiBuilderError, WithStorage};
@@ -144,24 +143,24 @@ use torii_core::repositories::OAuthRepositoryAdapter;
 use torii_core::repositories::PasskeyRepositoryAdapter;
 
 #[cfg(feature = "password")]
-use torii_core::services::PasswordService;
+use torii_services::PasswordService;
 
 #[cfg(feature = "oauth")]
-use torii_core::services::OAuthService;
+use torii_services::OAuthService;
 
 #[cfg(feature = "passkey")]
-use torii_core::services::PasskeyService;
+use torii_services::PasskeyService;
 
 #[cfg(feature = "magic-link")]
-use torii_core::services::MagicLinkService;
+use torii_services::MagicLinkService;
 
 #[cfg(any(feature = "password", feature = "magic-link"))]
-pub use torii_core::services::PasswordResetService;
+pub use torii_services::PasswordResetService;
 
-use torii_core::services::EmailVerificationService;
+use torii_services::EmailVerificationService;
 
 #[cfg(feature = "mailer")]
-use torii_core::services::{MailerService, ToriiMailerService};
+use torii_services::{MailerService, ToriiMailerService};
 
 /// Re-export core types from torii_core
 ///

@@ -1,11 +1,11 @@
-use crate::{
-    Error, User,
-    repositories::{TokenRepository, UserRepository},
-    services::UserService,
-    storage::{SecureToken, TokenPurpose},
-};
+use crate::services::UserService;
 use chrono::Duration;
 use std::sync::Arc;
+use torii_core::{
+    Error, User,
+    repositories::{TokenRepository, UserRepository},
+    storage::{SecureToken, TokenPurpose},
+};
 
 /// Service for magic link authentication operations
 pub struct MagicLinkService<U: UserRepository, T: TokenRepository> {
@@ -75,14 +75,14 @@ impl<U: UserRepository, T: TokenRepository> MagicLinkService<U, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repositories::{TokenRepository, UserRepository};
-    use crate::storage::{SecureToken, TokenPurpose};
-    use crate::{User, UserId};
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
+    use torii_core::repositories::{TokenRepository, UserRepository};
+    use torii_core::storage::{SecureToken, TokenPurpose};
+    use torii_core::{User, UserId};
 
     // Mock implementations for testing
     #[derive(Debug, Clone)]
@@ -116,7 +116,7 @@ mod tests {
 
     #[async_trait]
     impl UserRepository for MockUserRepository {
-        async fn create(&self, new_user: crate::storage::NewUser) -> Result<User, Error> {
+        async fn create(&self, new_user: torii_core::storage::NewUser) -> Result<User, Error> {
             let user = MockUser {
                 id: UserId::new_random(),
                 email: new_user.email.clone(),
@@ -154,7 +154,7 @@ mod tests {
             if let Some(user) = self.find_by_email(email).await? {
                 Ok(user)
             } else {
-                let new_user = crate::storage::NewUser::builder()
+                let new_user = torii_core::storage::NewUser::builder()
                     .email(email.to_string())
                     .build()
                     .unwrap();
@@ -189,7 +189,7 @@ mod tests {
             purpose: TokenPurpose,
             expires_in: Duration,
         ) -> Result<SecureToken, Error> {
-            use crate::crypto::hash_token;
+            use torii_core::crypto::hash_token;
 
             let token_str = "test_token_123".to_string();
             let token_hash = hash_token(&token_str);
@@ -220,7 +220,7 @@ mod tests {
             token: &str,
             purpose: TokenPurpose,
         ) -> Result<Option<SecureToken>, Error> {
-            use crate::crypto::hash_token;
+            use torii_core::crypto::hash_token;
 
             let mut tokens = self.tokens.lock().await;
             let token_hash = hash_token(token);
@@ -243,7 +243,7 @@ mod tests {
         }
 
         async fn check_token(&self, token: &str, purpose: TokenPurpose) -> Result<bool, Error> {
-            use crate::crypto::hash_token;
+            use torii_core::crypto::hash_token;
 
             let tokens = self.tokens.lock().await;
             let token_hash = hash_token(token);

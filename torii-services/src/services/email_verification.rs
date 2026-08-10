@@ -2,13 +2,13 @@
 //!
 //! This module provides functionality for email verification flows.
 
-use crate::{
+use chrono::Duration;
+use std::sync::Arc;
+use torii_core::{
     Error, User, UserId,
     repositories::{TokenRepository, UserRepository},
     storage::{SecureToken, TokenPurpose},
 };
-use chrono::Duration;
-use std::sync::Arc;
 
 /// Default expiration time for email verification tokens (24 hours)
 const DEFAULT_TOKEN_EXPIRATION: Duration = Duration::hours(24);
@@ -99,7 +99,7 @@ impl<U: UserRepository, T: TokenRepository> EmailVerificationService<U, T> {
             .verify_token(token, TokenPurpose::EmailVerification)
             .await?
             .ok_or_else(|| {
-                Error::Session(crate::error::SessionError::InvalidToken(
+                Error::Session(torii_core::error::SessionError::InvalidToken(
                     "Invalid or expired email verification token".to_string(),
                 ))
             })?;
@@ -113,7 +113,7 @@ impl<U: UserRepository, T: TokenRepository> EmailVerificationService<U, T> {
         self.user_repository
             .find_by_id(&secure_token.user_id)
             .await?
-            .ok_or(Error::Storage(crate::error::StorageError::NotFound))
+            .ok_or(Error::Storage(torii_core::error::StorageError::NotFound))
     }
 
     /// Clean up expired email verification tokens

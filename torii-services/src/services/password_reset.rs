@@ -1,13 +1,13 @@
-use crate::{
+use crate::services::{PasswordService, UserService};
+use chrono::Duration;
+use std::sync::Arc;
+use torii_core::{
     Error, User,
     error::AuthError,
     repositories::{PasswordRepository, TokenRepository, UserRepository},
-    services::{PasswordService, UserService},
     storage::TokenPurpose,
     validation::validate_password,
 };
-use chrono::Duration;
-use std::sync::Arc;
 
 /// Service for password reset operations
 pub struct PasswordResetService<U: UserRepository, P: PasswordRepository, T: TokenRepository> {
@@ -148,14 +148,14 @@ impl<U: UserRepository, P: PasswordRepository, T: TokenRepository> PasswordReset
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repositories::{PasswordRepository, TokenRepository, UserRepository};
-    use crate::storage::{NewUser, SecureToken, TokenPurpose};
-    use crate::{User, UserId};
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
+    use torii_core::repositories::{PasswordRepository, TokenRepository, UserRepository};
+    use torii_core::storage::{NewUser, SecureToken, TokenPurpose};
+    use torii_core::{User, UserId};
 
     // Mock implementations for testing
     #[derive(Debug, Clone)]
@@ -284,7 +284,7 @@ mod tests {
             purpose: TokenPurpose,
             expires_in: Duration,
         ) -> Result<SecureToken, Error> {
-            use crate::crypto::hash_token;
+            use torii_core::crypto::hash_token;
 
             let token_str = format!("token_{}", uuid::Uuid::new_v4());
             let token_hash = hash_token(&token_str);
@@ -314,7 +314,7 @@ mod tests {
             token: &str,
             purpose: TokenPurpose,
         ) -> Result<Option<SecureToken>, Error> {
-            use crate::crypto::hash_token;
+            use torii_core::crypto::hash_token;
 
             let mut tokens = self.tokens.lock().await;
             let token_hash = hash_token(token);
@@ -337,7 +337,7 @@ mod tests {
         }
 
         async fn check_token(&self, token: &str, purpose: TokenPurpose) -> Result<bool, Error> {
-            use crate::crypto::hash_token;
+            use torii_core::crypto::hash_token;
 
             let tokens = self.tokens.lock().await;
             let token_hash = hash_token(token);

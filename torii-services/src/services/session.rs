@@ -1,6 +1,6 @@
-use crate::{Error, Session, SessionProvider, SessionToken, UserId};
 use chrono::Duration;
 use std::sync::Arc;
+use torii_core::{Error, Session, SessionProvider, SessionToken, UserId};
 
 /// Service for session management operations
 pub struct SessionService<P: SessionProvider> {
@@ -30,8 +30,8 @@ impl<P: SessionProvider> SessionService<P> {
     pub async fn get_session(&self, token: &SessionToken) -> Result<Option<Session>, Error> {
         match self.provider.get_session(token).await {
             Ok(session) => Ok(Some(session)),
-            Err(crate::Error::Session(crate::error::SessionError::NotFound)) => Ok(None),
-            Err(crate::Error::Session(crate::error::SessionError::Expired)) => Ok(None),
+            Err(torii_core::Error::Session(torii_core::error::SessionError::NotFound)) => Ok(None),
+            Err(torii_core::Error::Session(torii_core::error::SessionError::Expired)) => Ok(None),
             Err(e) => Err(e),
         }
     }

@@ -15,8 +15,8 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use torii_core::services::BruteForceProtectionService;
 //! use torii_core::storage::BruteForceProtectionConfig;
+//! use torii_services::BruteForceProtectionService;
 //!
 //! let service = BruteForceProtectionService::new(
 //!     repository,
@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 
-use crate::{
+use torii_core::{
     Error,
     repositories::BruteForceProtectionRepository,
     storage::{AttemptStats, BruteForceProtectionConfig, LockoutStatus},
@@ -293,10 +293,10 @@ impl<R: BruteForceProtectionRepository> BruteForceProtectionService<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::FailedLoginAttempt;
     use async_trait::async_trait;
     use chrono::{DateTime, Duration};
     use std::sync::Mutex;
+    use torii_core::storage::FailedLoginAttempt;
 
     /// Mock repository for testing
     struct MockBruteForceRepository {

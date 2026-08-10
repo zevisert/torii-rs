@@ -1,11 +1,11 @@
-use crate::{
+use crate::services::UserService;
+use chrono::Duration;
+use std::sync::Arc;
+use torii_core::{
     Error, OAuthAccount, User, UserId,
     error::AuthError,
     repositories::{OAuthRepository, UserRepository},
-    services::UserService,
 };
-use chrono::Duration;
-use std::sync::Arc;
 
 /// Service for OAuth authentication operations
 pub struct OAuthService<U: UserRepository, O: OAuthRepository> {
@@ -142,13 +142,13 @@ impl<U: UserRepository, O: OAuthRepository> OAuthService<U, O> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repositories::{OAuthRepository, UserRepository};
-    use crate::{User, UserId};
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
+    use torii_core::repositories::{OAuthRepository, UserRepository};
+    use torii_core::{User, UserId};
 
     // Mock implementations for testing
     #[derive(Debug, Clone)]
@@ -182,7 +182,7 @@ mod tests {
 
     #[async_trait]
     impl UserRepository for MockUserRepository {
-        async fn create(&self, new_user: crate::storage::NewUser) -> Result<User, Error> {
+        async fn create(&self, new_user: torii_core::storage::NewUser) -> Result<User, Error> {
             let user = MockUser {
                 id: UserId::new_random(),
                 email: new_user.email.clone(),
@@ -220,7 +220,7 @@ mod tests {
             if let Some(user) = self.find_by_email(email).await? {
                 Ok(user)
             } else {
-                let new_user = crate::storage::NewUser::builder()
+                let new_user = torii_core::storage::NewUser::builder()
                     .email(email.to_string())
                     .build()
                     .unwrap();

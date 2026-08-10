@@ -1,7 +1,7 @@
-use crate::{
+use std::sync::Arc;
+use torii_core::{
     Error, User, UserId, repositories::UserRepository, storage::NewUser, validation::validate_email,
 };
-use std::sync::Arc;
 
 /// Service for user management operations
 pub struct UserService<R: UserRepository> {

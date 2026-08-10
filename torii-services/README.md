@@ -1,20 +1,19 @@
-# torii-core
+# torii-services
 
-Core functionality for the Torii authentication framework.
+Service implementations for the Torii authentication framework.
 
-This crate provides the runtime-neutral foundational types, traits, storage
-abstractions, and session providers used by Torii. Server-side authentication
-services live in `torii-services`, allowing this crate to compile for browser
-WASM targets.
+This crate contains the Tokio-dependent authentication services and event bus
+used by the server-side `torii` crate. Foundational types, storage traits, and
+runtime-neutral session providers live in `torii-core`.
 
 ## Features
 
 - **User Management**: Core user types and management services
 - **Session Management**: Flexible session handling with both opaque and JWT tokens
-- **Storage Abstraction**: Database-agnostic repository and storage traits
-- **Storage Abstraction**: Database-agnostic storage traits and repository patterns
-- **Type Safety**: Strongly typed IDs and newtype patterns for security
-- **Async/Await**: Fully async operations with tokio support
+- **Service Architecture**: Modular services for different authentication methods
+- **Event Bus**: Event handler registration and asynchronous event delivery
+- **Storage Integration**: Services built on the repository traits from `torii-core`
+- **Async/Await**: Tokio-based server-side service implementations
 - **Error Handling**: Comprehensive error types with structured error handling
 
 ## Core Types
@@ -46,9 +45,9 @@ Sessions track user authentication state and can be implemented as either opaque
 | `updated_at` | `DateTime`       | The timestamp when the session was last updated       |
 | `expires_at` | `DateTime`       | The timestamp when the session expires                |
 
-## Server Services
+## Service Architecture
 
-Authentication services are implemented in the separate `torii-services` crate:
+Torii uses a service-oriented architecture with the following core services:
 
 ### UserService
 
@@ -182,16 +181,19 @@ pub enum Error {
 
 ## Usage
 
-This crate is typically used indirectly through the main `torii` crate, or
-directly when implementing storage providers or browser-compatible clients.
+This crate is typically used indirectly through the main `torii` crate, but can
+be used directly for custom server implementations:
 
 ```rust
-use torii_core::{Session, User, UserId};
+use torii_services::{SessionService, UserService};
 
-// Core types can be used without a server runtime.
-let user_id = UserId::new("user_123");
-let _user: Option<User> = None;
-let _session: Option<Session> = None;
+// Create services with repository adapters from your storage backend
+let user_service = UserService::new(user_repository);
+let session_service = SessionService::new(session_provider);
+
+// Use the services
+let user = user_service.create_user(&new_user).await?;
+let session = session_service.create_session(&user.id, None, None, duration).await?;
 ```
 
 ## Integration

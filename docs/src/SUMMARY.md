@@ -4,3 +4,4 @@
 - [Getting Started](./getting-started.md)
 - [Axum Integration](./axum-integration.md)
 - [Core Concepts](./core-concepts/index.md)
+- [WASM Clients](./wasm-clients.md)

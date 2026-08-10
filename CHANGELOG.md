@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added `torii-client` with transport-neutral, compile-checked HTTP endpoint contracts.
+- Added WASM-compatible `torii-core` configuration for Rust browser clients.
+- Added `torii-services` for Tokio-dependent authentication services and the event bus.
+
+### Changed
+
+- **BREAKING CHANGE**: Moved authentication services and `EventBus` from `torii-core` to `torii-services`.
+
 ## [0.4.0] - 2025-07-06
 
 ### Added

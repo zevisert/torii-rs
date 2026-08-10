@@ -27,6 +27,7 @@ Check out the example [todos](./examples/todos/README.md) to see Torii in action
 - **Multiple Storage Backends**: SQLite, PostgreSQL, MySQL support
 - **Type Safety**: Strongly typed APIs with compile-time guarantees
 - **Async/Await**: Built for modern async Rust applications
+- **WASM Clients**: Compile-checked browser clients through `torii-client`
 
 ## Storage Backend Support
 
@@ -146,6 +147,8 @@ The Torii project is organized into several crates:
 
 - **[`torii`](./torii/)** - Main authentication coordinator and public API
 - **[`torii-core`](./torii-core/)** - Core types, traits, and services
+- **[`torii-services`](./torii-services/)** - Tokio-dependent authentication services and event bus
+- **[`torii-client`](./torii-client/)** - Transport-neutral typed HTTP contracts for Rust clients
 - **[`torii-migration`](./torii-migration/)** - Database migration management
 
 ### Storage Backends
@@ -167,12 +170,21 @@ The Torii project is organized into several crates:
 
 Torii uses a service-oriented architecture:
 
+- **Core**: Runtime-neutral types, storage traits, and session providers in `torii-core`
 - **Services**: Handle business logic for authentication methods (password, OAuth, etc.)
+- **Client contracts**: Shared endpoint paths and request/response types in `torii-client`
 - **Repositories**: Provide data access abstractions for different storage backends
 - **Storage Backends**: Implement concrete database operations
 - **Session Providers**: Handle session token generation and validation (opaque or JWT)
 
 This modular design allows you to mix and match components based on your needs while maintaining type safety and performance.
+
+### Browser and WASM clients
+
+Rust browser applications can depend on `torii-client` with its `wasm` feature.
+The crate defines endpoint metadata and typed request/response pairs without
+choosing an HTTP implementation, so a Dioxus application can provide its own
+browser transport while sharing contracts with `torii-axum`.
 
 ## Security
 

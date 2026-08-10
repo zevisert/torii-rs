@@ -14,26 +14,28 @@
 //! | `updated_at` | `DateTime`       | The timestamp when the session was last updated.       |
 //! | `expires_at` | `DateTime`       | The timestamp when the session will expire.            |
 
+#[cfg(feature = "jwt")]
 pub mod jwt;
 pub mod opaque;
 pub mod provider;
 
+#[cfg(feature = "jwt")]
 use std::path::Path;
 
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use chrono::{DateTime, Duration, Utc};
+#[cfg(feature = "jwt")]
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use rand::{TryRngCore, rngs::OsRng};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    Error,
-    error::{SessionError, ValidationError},
-    user::UserId,
-};
+#[cfg(feature = "jwt")]
+use crate::error::SessionError;
+use crate::{Error, error::ValidationError, user::UserId};
 
 // Re-export provider types for convenience
+#[cfg(feature = "jwt")]
 pub use jwt::JwtSessionProvider;
 pub use opaque::OpaqueSessionProvider;
 pub use provider::SessionProvider;
@@ -83,6 +85,7 @@ impl SessionToken {
     }
 
     /// Create a new JWT session token with the specified algorithm
+    #[cfg(feature = "jwt")]
     pub fn new_jwt(claims: &JwtClaims, config: &JwtConfig) -> Result<Self, Error> {
         let header = Header::new(config.jwt_algorithm());
 
@@ -95,6 +98,7 @@ impl SessionToken {
     }
 
     /// Verify a JWT session token and return the claims
+    #[cfg(feature = "jwt")]
     pub fn verify_jwt(&self, config: &JwtConfig) -> Result<JwtClaims, Error> {
         match self {
             SessionToken::Jwt(token) => {
@@ -116,12 +120,14 @@ impl SessionToken {
     }
 
     /// Create a new JWT session token using RS256 algorithm
+    #[cfg(feature = "jwt")]
     pub fn new_jwt_rs256(claims: &JwtClaims, private_key: &[u8]) -> Result<Self, Error> {
         let config = JwtConfig::new_rs256(private_key.to_vec(), vec![]);
         Self::new_jwt(claims, &config)
     }
 
     /// Verify a JWT session token using RS256 algorithm and return the claims
+    #[cfg(feature = "jwt")]
     pub fn verify_jwt_rs256(&self, public_key: &[u8]) -> Result<JwtClaims, Error> {
         let config = JwtConfig::new_rs256(vec![], public_key.to_vec());
         self.verify_jwt(&config)
@@ -137,6 +143,7 @@ impl SessionToken {
     /// # Errors
     ///
     /// Returns an error if the secret key is too short or if JWT encoding fails.
+    #[cfg(feature = "jwt")]
     pub fn new_jwt_hs256(claims: &JwtClaims, secret_key: &[u8]) -> Result<Self, Error> {
         let config = JwtConfig::new_hs256(secret_key.to_vec())?;
         Self::new_jwt(claims, &config)
@@ -152,6 +159,7 @@ impl SessionToken {
     /// # Errors
     ///
     /// Returns an error if the secret key is too short or if JWT verification fails.
+    #[cfg(feature = "jwt")]
     pub fn verify_jwt_hs256(&self, secret_key: &[u8]) -> Result<JwtClaims, Error> {
         let config = JwtConfig::new_hs256(secret_key.to_vec())?;
         self.verify_jwt(&config)
@@ -311,6 +319,7 @@ impl<'de> Deserialize<'de> for SessionToken {
 }
 
 /// JWT claims for session tokens
+#[cfg(feature = "jwt")]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JwtClaims {
     /// Subject - user ID
@@ -328,6 +337,7 @@ pub struct JwtClaims {
 }
 
 /// JWT metadata for additional session data
+#[cfg(feature = "jwt")]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JwtMetadata {
     /// User agent string
@@ -339,6 +349,7 @@ pub struct JwtMetadata {
 }
 
 /// JWT algorithm type
+#[cfg(feature = "jwt")]
 #[derive(Debug, Clone)]
 pub enum JwtAlgorithm {
     /// RS256 - RSA with SHA-256
@@ -356,6 +367,7 @@ pub enum JwtAlgorithm {
 }
 
 /// Configuration for JWT sessions
+#[cfg(feature = "jwt")]
 #[derive(Debug, Clone)]
 pub struct JwtConfig {
     /// Algorithm and keys for JWT
@@ -366,6 +378,7 @@ pub struct JwtConfig {
     pub include_metadata: bool,
 }
 
+#[cfg(feature = "jwt")]
 impl JwtConfig {
     /// Create a new JWT configuration with RS256 algorithm
     pub fn new_rs256(private_key: Vec<u8>, public_key: Vec<u8>) -> Self {
@@ -558,6 +571,7 @@ impl Session {
     }
 
     /// Convert session to JWT claims
+    #[cfg(feature = "jwt")]
     pub fn to_jwt_claims(&self, issuer: Option<String>, include_metadata: bool) -> JwtClaims {
         let metadata = if include_metadata {
             Some(JwtMetadata {
@@ -578,6 +592,7 @@ impl Session {
     }
 
     /// Create a session from JWT claims
+    #[cfg(feature = "jwt")]
     pub fn from_jwt_claims(token: SessionToken, claims: &JwtClaims) -> Self {
         let now = Utc::now();
         let created_at = DateTime::from_timestamp(claims.iat, 0).unwrap_or(now);

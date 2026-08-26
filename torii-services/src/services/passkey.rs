@@ -1,8 +1,7 @@
-use crate::{EventBus, EventEmitter, services::UserService};
+use crate::services::UserService;
 use std::sync::Arc;
 use torii_core::{
     Error, User, UserId,
-    events::Event,
     repositories::{PasskeyCredential, PasskeyRepository, UserRepository},
 };
 
@@ -10,7 +9,6 @@ use torii_core::{
 pub struct PasskeyService<U: UserRepository, P: PasskeyRepository> {
     user_service: Arc<UserService<U>>,
     passkey_repository: Arc<P>,
-    event_bus: Option<Arc<EventBus>>,
 }
 
 impl<U: UserRepository, P: PasskeyRepository> PasskeyService<U, P> {
@@ -20,19 +18,13 @@ impl<U: UserRepository, P: PasskeyRepository> PasskeyService<U, P> {
         Self {
             user_service,
             passkey_repository,
-            event_bus: None,
         }
-    }
-
-    /// Enable passkey event emission.
-    pub fn with_event_bus(mut self, event_bus: Arc<EventBus>) -> Self {
-        self.event_bus = Some(event_bus);
-        self
     }
 
     /// Register a new passkey credential for a user
     pub async fn register_credential(
         &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
         user_id: &UserId,
         credential_id: Vec<u8>,
         public_key: Vec<u8>,
@@ -40,9 +32,7 @@ impl<U: UserRepository, P: PasskeyRepository> PasskeyService<U, P> {
     ) -> Result<PasskeyCredential, Error> {
         let credential = self
             .passkey_repository
-            .add_credential(user_id, credential_id, public_key, name)
-            .await?;
-        self.emit_event(Event::PasskeyRegistered(user_id.clone()))
+            .add_credential(transaction, user_id, credential_id, public_key, name)
             .await?;
         Ok(credential)
     }
@@ -68,6 +58,7 @@ impl<U: UserRepository, P: PasskeyRepository> PasskeyService<U, P> {
     /// Authenticate with a passkey credential
     pub async fn authenticate_credential(
         &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
         credential_id: &[u8],
     ) -> Result<Option<User>, Error> {
         // Get the credential
@@ -79,16 +70,12 @@ impl<U: UserRepository, P: PasskeyRepository> PasskeyService<U, P> {
         if let Some(cred) = credential {
             // Update last used timestamp
             self.passkey_repository
-                .update_last_used(credential_id)
+                .update_last_used(transaction, credential_id)
                 .await?;
 
             // Get the user
             let user = self.user_service.get_user(&cred.user_id).await?;
 
-            if let Some(user) = &user {
-                self.emit_event(Event::PasskeyAuthenticated(user.id.clone()))
-                    .await?;
-            }
             Ok(user)
         } else {
             Ok(None)
@@ -96,37 +83,28 @@ impl<U: UserRepository, P: PasskeyRepository> PasskeyService<U, P> {
     }
 
     /// Delete a passkey credential
-    pub async fn delete_credential(&self, credential_id: &[u8]) -> Result<(), Error> {
-        let user_id = self
-            .passkey_repository
-            .get_credential(credential_id)
-            .await?
-            .map(|credential| credential.user_id);
-
+    pub async fn delete_credential(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        credential_id: &[u8],
+    ) -> Result<(), Error> {
         self.passkey_repository
-            .delete_credential(credential_id)
+            .delete_credential(transaction, credential_id)
             .await?;
-
-        if let Some(user_id) = user_id {
-            self.emit_event(Event::PasskeyRemoved(user_id)).await?;
-        }
 
         Ok(())
     }
 
     /// Delete all passkey credentials for a user
-    pub async fn delete_user_credentials(&self, user_id: &UserId) -> Result<(), Error> {
-        self.passkey_repository.delete_all_for_user(user_id).await?;
-        self.emit_event(Event::PasskeyRemoved(user_id.clone()))
+    pub async fn delete_user_credentials(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        user_id: &UserId,
+    ) -> Result<(), Error> {
+        self.passkey_repository
+            .delete_all_for_user(transaction, user_id)
             .await?;
         Ok(())
-    }
-}
-
-#[async_trait::async_trait]
-impl<U: UserRepository, P: PasskeyRepository> EventEmitter for PasskeyService<U, P> {
-    fn event_bus(&self) -> Option<&Arc<EventBus>> {
-        self.event_bus.as_ref()
     }
 }
 
@@ -172,7 +150,11 @@ mod tests {
 
     #[async_trait]
     impl UserRepository for MockUserRepository {
-        async fn create(&self, new_user: torii_core::storage::NewUser) -> Result<User, Error> {
+        async fn create(
+            &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
+            new_user: torii_core::storage::NewUser,
+        ) -> Result<User, Error> {
             let user = MockUser {
                 id: UserId::new_random(),
                 email: new_user.email,
@@ -211,19 +193,32 @@ mod tests {
                     .email(email.to_string())
                     .build()
                     .unwrap();
-                self.create(new_user).await
+                self.create(&mut torii_core::NoopTransactionAdapter, new_user)
+                    .await
             }
         }
 
-        async fn update(&self, _user: &User) -> Result<User, Error> {
+        async fn update(
+            &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
+            _user: &User,
+        ) -> Result<User, Error> {
             unimplemented!()
         }
 
-        async fn delete(&self, _id: &UserId) -> Result<(), Error> {
+        async fn delete(
+            &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
+            _id: &UserId,
+        ) -> Result<(), Error> {
             unimplemented!()
         }
 
-        async fn mark_email_verified(&self, _user_id: &UserId) -> Result<(), Error> {
+        async fn mark_email_verified(
+            &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
+            _user_id: &UserId,
+        ) -> Result<(), Error> {
             Ok(())
         }
     }
@@ -238,6 +233,7 @@ mod tests {
     impl PasskeyRepository for MockPasskeyRepository {
         async fn add_credential(
             &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
             user_id: &UserId,
             credential_id: Vec<u8>,
             public_key: Vec<u8>,
@@ -293,24 +289,36 @@ mod tests {
             }
         }
 
-        async fn update_last_used(&self, credential_id: &[u8]) -> Result<(), Error> {
+        async fn update_last_used(
+            &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
+            credential_id: &[u8],
+        ) -> Result<(), Error> {
             if let Some(cred) = self.credentials.lock().await.get_mut(credential_id) {
                 cred.last_used_at = Some(Utc::now());
             }
             Ok(())
         }
 
-        async fn delete_credential(&self, credential_id: &[u8]) -> Result<(), Error> {
+        async fn delete_credential(
+            &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
+            credential_id: &[u8],
+        ) -> Result<(), Error> {
             self.credentials.lock().await.remove(credential_id);
             // Also remove from user credentials
             let mut user_creds = self.user_credentials.lock().await;
-            for (_, cred_ids) in user_creds.iter_mut() {
+            for cred_ids in user_creds.values_mut() {
                 cred_ids.retain(|id| id != credential_id);
             }
             Ok(())
         }
 
-        async fn delete_all_for_user(&self, user_id: &UserId) -> Result<(), Error> {
+        async fn delete_all_for_user(
+            &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
+            user_id: &UserId,
+        ) -> Result<(), Error> {
             let mut user_creds = self.user_credentials.lock().await;
             if let Some(cred_ids) = user_creds.remove(user_id) {
                 let mut credentials = self.credentials.lock().await;
@@ -335,6 +343,7 @@ mod tests {
 
         let result = service
             .register_credential(
+                &mut torii_core::NoopTransactionAdapter,
                 &user_id,
                 credential_id.clone(),
                 public_key.clone(),
@@ -362,7 +371,13 @@ mod tests {
 
         // First register a credential
         service
-            .register_credential(&user_id, credential_id.clone(), public_key, None)
+            .register_credential(
+                &mut torii_core::NoopTransactionAdapter,
+                &user_id,
+                credential_id.clone(),
+                public_key,
+                None,
+            )
             .await
             .unwrap();
 
@@ -387,7 +402,13 @@ mod tests {
 
         // First register a credential
         service
-            .register_credential(&user_id, credential_id.clone(), public_key, None)
+            .register_credential(
+                &mut torii_core::NoopTransactionAdapter,
+                &user_id,
+                credential_id.clone(),
+                public_key,
+                None,
+            )
             .await
             .unwrap();
 
@@ -425,14 +446,25 @@ mod tests {
             .email("test@example.com".to_string())
             .build()
             .unwrap();
-        let user = user_repo.create(new_user).await.unwrap();
+        let user = user_repo
+            .create(&mut torii_core::NoopTransactionAdapter, new_user)
+            .await
+            .unwrap();
         service
-            .register_credential(&user.id, credential_id.clone(), public_key, None)
+            .register_credential(
+                &mut torii_core::NoopTransactionAdapter,
+                &user.id,
+                credential_id.clone(),
+                public_key,
+                None,
+            )
             .await
             .unwrap();
 
         // Then authenticate with the credential
-        let result = service.authenticate_credential(&credential_id).await;
+        let result = service
+            .authenticate_credential(&mut torii_core::NoopTransactionAdapter, &credential_id)
+            .await;
         assert!(result.is_ok());
 
         let auth_user = result.unwrap();
@@ -446,7 +478,9 @@ mod tests {
         let passkey_repo = Arc::new(MockPasskeyRepository::default());
         let service = PasskeyService::new(user_repo, passkey_repo);
 
-        let result = service.authenticate_credential(&[9, 9, 9]).await;
+        let result = service
+            .authenticate_credential(&mut torii_core::NoopTransactionAdapter, &[9, 9, 9])
+            .await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
     }
@@ -463,7 +497,13 @@ mod tests {
 
         // First register a credential
         service
-            .register_credential(&user_id, credential_id.clone(), public_key, None)
+            .register_credential(
+                &mut torii_core::NoopTransactionAdapter,
+                &user_id,
+                credential_id.clone(),
+                public_key,
+                None,
+            )
             .await
             .unwrap();
 
@@ -473,7 +513,9 @@ mod tests {
         assert!(result.unwrap().is_some());
 
         // Delete it
-        let result = service.delete_credential(&credential_id).await;
+        let result = service
+            .delete_credential(&mut torii_core::NoopTransactionAdapter, &credential_id)
+            .await;
         assert!(result.is_ok());
 
         // Verify it's gone
@@ -495,11 +537,23 @@ mod tests {
 
         // Register two credentials for the user
         service
-            .register_credential(&user_id, credential_id1.clone(), public_key.clone(), None)
+            .register_credential(
+                &mut torii_core::NoopTransactionAdapter,
+                &user_id,
+                credential_id1.clone(),
+                public_key.clone(),
+                None,
+            )
             .await
             .unwrap();
         service
-            .register_credential(&user_id, credential_id2.clone(), public_key, None)
+            .register_credential(
+                &mut torii_core::NoopTransactionAdapter,
+                &user_id,
+                credential_id2.clone(),
+                public_key,
+                None,
+            )
             .await
             .unwrap();
 
@@ -509,7 +563,9 @@ mod tests {
         assert_eq!(result.unwrap().len(), 2);
 
         // Delete all credentials for the user
-        let result = service.delete_user_credentials(&user_id).await;
+        let result = service
+            .delete_user_credentials(&mut torii_core::NoopTransactionAdapter, &user_id)
+            .await;
         assert!(result.is_ok());
 
         // Verify they're gone

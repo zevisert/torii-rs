@@ -23,6 +23,7 @@ pub mod passkey;
 pub mod password;
 pub mod session;
 pub mod token;
+pub mod transaction_view;
 pub mod user;
 
 pub use adapter::{
@@ -36,11 +37,24 @@ pub use passkey::{PasskeyCredential, PasskeyRepository};
 pub use password::PasswordRepository;
 pub use session::SessionRepository;
 pub use token::TokenRepository;
+pub use transaction_view::{
+    TransactionBruteForceRepository, TransactionOAuthRepository, TransactionPasskeyRepository,
+    TransactionPasswordRepository, TransactionRepositoryView, TransactionSessionRepository,
+    TransactionTokenRepository, TransactionUserRepository, TransactionalRepositoryProvider,
+};
 pub use user::UserRepository;
 
 use async_trait::async_trait;
 
 use crate::Error;
+use crate::transaction::TransactionRunner;
+
+/// Provides the backend-owned transaction runner used by lifecycle hooks.
+pub trait TransactionRunnerProvider: Send + Sync + 'static {
+    type TransactionRunner: TransactionRunner;
+
+    fn transaction_runner(&self) -> Self::TransactionRunner;
+}
 
 // ============================================================================
 // Individual Repository Provider Traits
@@ -168,6 +182,7 @@ pub trait RepositoryProvider:
     + PasskeyRepositoryProvider
     + TokenRepositoryProvider
     + BruteForceRepositoryProvider
+    + TransactionRunnerProvider
 {
     /// Run migrations for all repositories
     async fn migrate(&self) -> Result<(), Error>;

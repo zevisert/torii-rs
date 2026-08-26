@@ -1,5 +1,6 @@
 //! PostgreSQL implementation of the passkey repository.
 
+use crate::PostgresTransactionAdapter;
 use async_trait::async_trait;
 use base64::prelude::*;
 use chrono::{DateTime, Utc};
@@ -9,6 +10,20 @@ use torii_core::{
     error::StorageError,
     repositories::{PasskeyCredential, PasskeyRepository},
 };
+
+fn pg_connection(
+    value: &mut dyn torii_core::TransactionAdapter,
+) -> Result<&mut sqlx::PgConnection, Error> {
+    value
+        .as_any_mut()
+        .downcast_mut::<PostgresTransactionAdapter>()
+        .map(|adapter| &mut *adapter.transaction)
+        .ok_or_else(|| {
+            Error::Storage(StorageError::Database(
+                "PostgreSQL transaction adapter required".into(),
+            ))
+        })
+}
 
 /// PostgreSQL repository for passkey data.
 pub struct PostgresPasskeyRepository {
@@ -40,6 +55,7 @@ struct PostgresPasskey {
 impl PasskeyRepository for PostgresPasskeyRepository {
     async fn add_credential(
         &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
         user_id: &UserId,
         credential_id: Vec<u8>,
         public_key: Vec<u8>,
@@ -62,7 +78,7 @@ impl PasskeyRepository for PostgresPasskeyRepository {
         .bind(&name)
         .bind(now)
         .bind(now)
-        .fetch_one(&self.pool)
+        .fetch_one(pg_connection(transaction)?)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "Failed to add passkey credential");
@@ -175,7 +191,11 @@ impl PasskeyRepository for PostgresPasskeyRepository {
         }
     }
 
-    async fn update_last_used(&self, credential_id: &[u8]) -> Result<(), Error> {
+    async fn update_last_used(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        credential_id: &[u8],
+    ) -> Result<(), Error> {
         let credential_id_b64 = BASE64_STANDARD.encode(credential_id);
         let now = Utc::now();
 
@@ -188,7 +208,7 @@ impl PasskeyRepository for PostgresPasskeyRepository {
         .bind(now)
         .bind(now)
         .bind(&credential_id_b64)
-        .execute(&self.pool)
+        .execute(pg_connection(transaction)?)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "Failed to update passkey last_used_at");
@@ -200,12 +220,16 @@ impl PasskeyRepository for PostgresPasskeyRepository {
         Ok(())
     }
 
-    async fn delete_credential(&self, credential_id: &[u8]) -> Result<(), Error> {
+    async fn delete_credential(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        credential_id: &[u8],
+    ) -> Result<(), Error> {
         let credential_id_b64 = BASE64_STANDARD.encode(credential_id);
 
         sqlx::query("DELETE FROM passkeys WHERE credential_id = $1")
             .bind(&credential_id_b64)
-            .execute(&self.pool)
+            .execute(pg_connection(transaction)?)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "Failed to delete passkey credential");
@@ -217,10 +241,14 @@ impl PasskeyRepository for PostgresPasskeyRepository {
         Ok(())
     }
 
-    async fn delete_all_for_user(&self, user_id: &UserId) -> Result<(), Error> {
+    async fn delete_all_for_user(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        user_id: &UserId,
+    ) -> Result<(), Error> {
         sqlx::query("DELETE FROM passkeys WHERE user_id = $1")
             .bind(user_id.as_str())
-            .execute(&self.pool)
+            .execute(pg_connection(transaction)?)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "Failed to delete all passkeys for user");

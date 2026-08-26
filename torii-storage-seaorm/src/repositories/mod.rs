@@ -6,6 +6,7 @@ pub mod passkey;
 pub mod password;
 pub mod session;
 pub mod token;
+pub mod transaction;
 pub mod user;
 
 pub use brute_force::SeaORMBruteForceRepository;
@@ -14,6 +15,10 @@ pub use passkey::SeaORMPasskeyRepository;
 pub use password::SeaORMPasswordRepository;
 pub use session::SeaORMSessionRepository;
 pub use token::SeaORMTokenRepository;
+pub use transaction::{
+    SeaORMBruteForce, SeaORMOAuth, SeaORMPasskeys, SeaORMPasswords, SeaORMSessions, SeaORMTokens,
+    SeaORMTransaction, SeaORMUsers,
+};
 pub use user::SeaORMUserRepository;
 
 use crate::SeaORMStorageError;
@@ -26,7 +31,7 @@ use torii_core::{
     repositories::{
         BruteForceRepositoryProvider, OAuthRepositoryProvider, PasskeyRepositoryProvider,
         PasswordRepositoryProvider, RepositoryProvider, SessionRepositoryProvider,
-        TokenRepositoryProvider, UserRepositoryProvider,
+        TokenRepositoryProvider, TransactionalRepositoryProvider, UserRepositoryProvider,
     },
 };
 
@@ -66,6 +71,28 @@ impl SeaORMRepositoryProvider {
             token,
             brute_force,
         }
+    }
+
+    /// Begin a transaction for a transaction-aware Torii operation.
+    pub async fn begin_transaction(&self) -> Result<sea_orm::DatabaseTransaction, sea_orm::DbErr> {
+        use sea_orm::TransactionTrait;
+
+        self.pool.begin().await
+    }
+
+    /// Clone the underlying database connection for a transaction runner.
+    pub fn database_connection(&self) -> sea_orm::DatabaseConnection {
+        self.pool.clone()
+    }
+
+    /// Access the user repository for transaction-scoped operations.
+    pub fn user_repository(&self) -> Arc<SeaORMUserRepository> {
+        self.user.clone()
+    }
+
+    /// Access the password repository for transaction-scoped operations.
+    pub fn password_repository(&self) -> Arc<SeaORMPasswordRepository> {
+        self.password.clone()
     }
 }
 
@@ -124,6 +151,17 @@ impl BruteForceRepositoryProvider for SeaORMRepositoryProvider {
 
     fn brute_force(&self) -> &Self::BruteForceRepo {
         &self.brute_force
+    }
+}
+
+impl TransactionalRepositoryProvider for SeaORMRepositoryProvider {
+    type Transaction<'a> = transaction::SeaORMTransaction<'a>;
+
+    fn transaction<'a>(
+        &'a self,
+        transaction: &'a mut dyn torii_core::TransactionAdapter,
+    ) -> Result<Self::Transaction<'a>, Error> {
+        transaction::SeaORMTransaction::new(transaction)
     }
 }
 

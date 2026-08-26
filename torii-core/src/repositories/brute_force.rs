@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use crate::{
     Error,
     storage::{AttemptStats, FailedLoginAttempt},
+    transaction::TransactionAdapter,
 };
 
 /// Repository for brute force protection data.
@@ -41,6 +42,7 @@ pub trait BruteForceProtectionRepository: Send + Sync + 'static {
     /// The created `FailedLoginAttempt` record with its assigned ID and timestamp.
     async fn record_failed_attempt(
         &self,
+        transaction: &mut dyn TransactionAdapter,
         email: &str,
         ip_address: Option<&str>,
     ) -> Result<FailedLoginAttempt, Error>;
@@ -75,7 +77,11 @@ pub trait BruteForceProtectionRepository: Send + Sync + 'static {
     /// # Returns
     ///
     /// The number of records deleted.
-    async fn clear_attempts(&self, email: &str) -> Result<u64, Error>;
+    async fn clear_attempts(
+        &self,
+        transaction: &mut dyn TransactionAdapter,
+        email: &str,
+    ) -> Result<u64, Error>;
 
     /// Delete attempts older than the given timestamp for unlocked accounts only.
     ///
@@ -108,6 +114,7 @@ pub trait BruteForceProtectionRepository: Send + Sync + 'static {
     /// to prevent user enumeration.
     async fn set_locked_at(
         &self,
+        transaction: &mut dyn TransactionAdapter,
         email: &str,
         locked_at: Option<DateTime<Utc>>,
     ) -> Result<(), Error>;

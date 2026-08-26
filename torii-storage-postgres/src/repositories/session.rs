@@ -1,5 +1,6 @@
 //! PostgreSQL implementation of the session repository.
 
+use crate::PostgresTransactionAdapter;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
@@ -33,7 +34,17 @@ struct PgSession {
 
 #[async_trait]
 impl SessionRepository for PostgresSessionRepository {
-    async fn create(&self, session: Session) -> Result<Session, Error> {
+    async fn create(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        session: Session,
+    ) -> Result<Session, Error> {
+        let adapter = transaction
+            .as_any_mut()
+            .downcast_mut::<PostgresTransactionAdapter>()
+            .ok_or_else(|| {
+                StorageError::Database("PostgreSQL transaction adapter required".into())
+            })?;
         // Store the hash, not the plaintext token
         sqlx::query(
             r#"
@@ -48,7 +59,7 @@ impl SessionRepository for PostgresSessionRepository {
         .bind(session.created_at)
         .bind(session.updated_at)
         .bind(session.expires_at)
-        .execute(&self.pool)
+        .execute(&mut *adapter.transaction)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "Failed to create session");
@@ -102,12 +113,22 @@ impl SessionRepository for PostgresSessionRepository {
         }
     }
 
-    async fn delete(&self, token: &SessionToken) -> Result<(), Error> {
+    async fn delete(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        token: &SessionToken,
+    ) -> Result<(), Error> {
+        let adapter = transaction
+            .as_any_mut()
+            .downcast_mut::<PostgresTransactionAdapter>()
+            .ok_or_else(|| {
+                StorageError::Database("PostgreSQL transaction adapter required".into())
+            })?;
         let token_hash = token.token_hash();
 
         sqlx::query("DELETE FROM sessions WHERE token = $1")
             .bind(&token_hash)
-            .execute(&self.pool)
+            .execute(&mut *adapter.transaction)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "Failed to delete session");
@@ -119,10 +140,20 @@ impl SessionRepository for PostgresSessionRepository {
         Ok(())
     }
 
-    async fn delete_by_user_id(&self, user_id: &UserId) -> Result<(), Error> {
+    async fn delete_by_user_id(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        user_id: &UserId,
+    ) -> Result<(), Error> {
+        let adapter = transaction
+            .as_any_mut()
+            .downcast_mut::<PostgresTransactionAdapter>()
+            .ok_or_else(|| {
+                StorageError::Database("PostgreSQL transaction adapter required".into())
+            })?;
         sqlx::query("DELETE FROM sessions WHERE user_id = $1")
             .bind(user_id.as_str())
-            .execute(&self.pool)
+            .execute(&mut *adapter.transaction)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "Failed to delete sessions for user");
@@ -185,7 +216,18 @@ impl SessionRepository for PostgresSessionRepository {
             .collect())
     }
 
-    async fn refresh(&self, token: &SessionToken, duration: Duration) -> Result<Session, Error> {
+    async fn refresh(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        token: &SessionToken,
+        duration: Duration,
+    ) -> Result<Session, Error> {
+        let adapter = transaction
+            .as_any_mut()
+            .downcast_mut::<PostgresTransactionAdapter>()
+            .ok_or_else(|| {
+                StorageError::Database("PostgreSQL transaction adapter required".into())
+            })?;
         let token_hash = token.token_hash();
         let now = Utc::now();
         let new_expires_at = now + duration;
@@ -194,7 +236,7 @@ impl SessionRepository for PostgresSessionRepository {
             .bind(new_expires_at)
             .bind(now)
             .bind(&token_hash)
-            .execute(&self.pool)
+            .execute(&mut *adapter.transaction)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "Failed to refresh session");
@@ -203,7 +245,6 @@ impl SessionRepository for PostgresSessionRepository {
                 ))
             })?;
 
-        // Fetch and return the updated session
         self.find_by_token(token)
             .await?
             .ok_or_else(|| Error::Storage(StorageError::Database("Session not found".to_string())))

@@ -120,19 +120,61 @@ mod builder;
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use torii_core::{
     JwtSessionProvider, OpaqueSessionProvider, RepositoryProvider, SessionProvider,
+    TransactionRunner,
     repositories::{
         BruteForceProtectionRepositoryAdapter, PasswordRepositoryAdapter, SessionRepositoryAdapter,
         TokenRepositoryAdapter, UserRepositoryAdapter,
     },
 };
-use torii_services::{BruteForceProtectionService, EventBus, SessionService, UserService};
+use torii_services::{
+    AuthenticateOAuthOperation, BruteForceProtectionService, DeleteUserOperation, EventBus,
+    HookRegistry, OAuthAuthenticationResult, RegisterUserOperation, SessionService, UserService,
+    VerifyEmailOperation,
+};
+
+/// Repository capability for operations that must share a transaction with hooks.
+#[async_trait]
+pub trait TransactionalRepositoryProvider:
+    RepositoryProvider + torii_core::repositories::TransactionalRepositoryProvider
+{
+    async fn register_user_transactional(
+        &self,
+        new_user: torii_core::storage::NewUser,
+        hooks: Arc<HookRegistry>,
+        password_hash: String,
+    ) -> Result<User, torii_services::HookError>;
+}
+
+#[cfg(any(
+    feature = "seaorm-sqlite",
+    feature = "seaorm-postgres",
+    feature = "seaorm-mysql"
+))]
+#[async_trait]
+impl TransactionalRepositoryProvider for torii_storage_seaorm::SeaORMRepositoryProvider {
+    async fn register_user_transactional(
+        &self,
+        new_user: torii_core::storage::NewUser,
+        hooks: Arc<HookRegistry>,
+        password_hash: String,
+    ) -> Result<User, torii_services::HookError> {
+        torii_core::TransactionRunnerProvider::transaction_runner(self)
+            .run(Box::new(RegisterUserOperation {
+                repositories: Arc::new(self.clone()),
+                hooks,
+                new_user,
+                password_hash,
+            }))
+            .await
+    }
+}
 
 // Re-export builder types
 pub use builder::{NoStorage, ToriiBuilder, ToriiBuilderError, WithStorage};
-
 // Re-export brute force protection config for users to configure
 pub use torii_core::BruteForceProtectionConfig;
 
@@ -170,9 +212,10 @@ pub use torii_core::{
     Event, EventHandler, JwtAlgorithm, JwtClaims, JwtConfig, JwtMetadata, LockoutStatus, Session,
     SessionToken, User, UserId,
 };
+pub use torii_services::EventPublisher;
 #[cfg(feature = "postgres")]
 pub use torii_services::PostgresEventTransport;
-pub use torii_services::{EventEmitter, EventPublisher};
+pub use torii_services::{HookDecision, HookError, ToriiHook};
 
 /// Re-export storage types
 pub use torii_core::storage::{SecureToken, TokenPurpose};
@@ -356,6 +399,7 @@ impl SessionConfig {
 pub struct Torii<R: RepositoryProvider> {
     repositories: Arc<R>,
     event_bus: Arc<EventBus>,
+    hook_registry: Arc<HookRegistry>,
     user_service: Arc<UserService<UserRepositoryAdapter<R>>>,
     session_service: Arc<SessionService<Box<dyn SessionProvider>>>,
     session_provider: Arc<Box<dyn SessionProvider>>,
@@ -429,7 +473,35 @@ impl<R: RepositoryProvider> Torii<R> {
     }
 }
 
-impl<R: RepositoryProvider> Torii<R> {
+#[cfg(any(
+    feature = "seaorm-sqlite",
+    feature = "seaorm-postgres",
+    feature = "seaorm-mysql"
+))]
+impl<R: TransactionalRepositoryProvider> Torii<R> {
+    /// Create a user with all configured registration hooks in one transaction.
+    pub async fn register_user_transactional(
+        &self,
+        email: impl Into<String>,
+        name: Option<String>,
+        password_hash: String,
+    ) -> Result<User, HookError> {
+        self.repositories
+            .register_user_transactional(
+                torii_core::storage::NewUser {
+                    id: UserId::new_random(),
+                    email: email.into(),
+                    name,
+                    email_verified_at: None,
+                },
+                self.hook_registry.clone(),
+                password_hash,
+            )
+            .await
+    }
+}
+
+impl<R: RepositoryProvider + torii_core::repositories::TransactionalRepositoryProvider> Torii<R> {
     /// Create a new Torii instance with a repository provider
     ///
     /// This constructor initializes Torii with all the required services
@@ -453,100 +525,77 @@ impl<R: RepositoryProvider> Torii<R> {
             repositories.clone(),
         ));
 
-        let user_service =
-            Arc::new(UserService::new(user_repo.clone()).with_event_bus(event_bus.clone()));
+        let user_service = Arc::new(UserService::new(user_repo.clone()));
 
         // Default to opaque session provider
         let session_provider: Arc<Box<dyn SessionProvider>> =
             Arc::new(Box::new(OpaqueSessionProvider::new(session_repo)));
-        let session_service = Arc::new(
-            SessionService::new(session_provider.clone()).with_event_bus(event_bus.clone()),
-        );
+        let session_service = Arc::new(SessionService::new(session_provider.clone()));
 
         // Initialize brute force protection with default config (enabled)
-        let brute_force_service = Arc::new(
-            BruteForceProtectionService::new(
-                brute_force_repo,
-                BruteForceProtectionConfig::default(),
-            )
-            .with_event_bus(event_bus.clone()),
-        );
+        let brute_force_service = Arc::new(BruteForceProtectionService::new(
+            brute_force_repo,
+            BruteForceProtectionConfig::default(),
+        ));
 
         Self {
             repositories: repositories.clone(),
             event_bus: event_bus.clone(),
+            hook_registry: Arc::new(HookRegistry::new()),
             user_service,
             session_service,
             session_provider,
 
             #[cfg(feature = "password")]
-            password_service: Arc::new(
-                PasswordService::new(
-                    user_repo.clone(),
-                    Arc::new(PasswordRepositoryAdapter::new(repositories.clone())),
-                )
-                .with_event_bus(event_bus.clone()),
-            ),
+            password_service: Arc::new(PasswordService::new(
+                user_repo.clone(),
+                Arc::new(PasswordRepositoryAdapter::new(repositories.clone())),
+            )),
 
             #[cfg(feature = "oauth")]
-            oauth_service: Arc::new(
-                OAuthService::new(
-                    user_repo.clone(),
-                    Arc::new(torii_core::repositories::OAuthRepositoryAdapter::new(
-                        repositories.clone(),
-                    )),
-                )
-                .with_event_bus(event_bus.clone()),
-            ),
+            oauth_service: Arc::new(OAuthService::new(
+                user_repo.clone(),
+                Arc::new(torii_core::repositories::OAuthRepositoryAdapter::new(
+                    repositories.clone(),
+                )),
+            )),
 
             #[cfg(feature = "passkey")]
-            passkey_service: Arc::new(
-                PasskeyService::new(
-                    user_repo.clone(),
-                    Arc::new(torii_core::repositories::PasskeyRepositoryAdapter::new(
-                        repositories.clone(),
-                    )),
-                )
-                .with_event_bus(event_bus.clone()),
-            ),
+            passkey_service: Arc::new(PasskeyService::new(
+                user_repo.clone(),
+                Arc::new(torii_core::repositories::PasskeyRepositoryAdapter::new(
+                    repositories.clone(),
+                )),
+            )),
 
             #[cfg(feature = "magic-link")]
-            magic_link_service: Arc::new(
-                MagicLinkService::new(
-                    user_repo.clone(),
-                    Arc::new(torii_core::repositories::TokenRepositoryAdapter::new(
-                        repositories.clone(),
-                    )),
-                )
-                .with_event_bus(event_bus.clone()),
-            ),
+            magic_link_service: Arc::new(MagicLinkService::new(
+                user_repo.clone(),
+                Arc::new(torii_core::repositories::TokenRepositoryAdapter::new(
+                    repositories.clone(),
+                )),
+            )),
 
             #[cfg(any(feature = "password", feature = "magic-link"))]
-            password_reset_service: Arc::new(
-                PasswordResetService::new(
-                    user_repo.clone(),
-                    Arc::new(PasswordRepositoryAdapter::new(repositories.clone())),
-                    Arc::new(torii_core::repositories::TokenRepositoryAdapter::new(
-                        repositories.clone(),
-                    )),
-                )
-                .with_event_bus(event_bus.clone()),
-            ),
+            password_reset_service: Arc::new(PasswordResetService::new(
+                user_repo.clone(),
+                Arc::new(PasswordRepositoryAdapter::new(repositories.clone())),
+                Arc::new(torii_core::repositories::TokenRepositoryAdapter::new(
+                    repositories.clone(),
+                )),
+            )),
 
             #[cfg(feature = "mailer")]
             mailer_service: None,
 
             brute_force_service,
 
-            email_verification_service: Arc::new(
-                EmailVerificationService::new(
-                    user_repo,
-                    Arc::new(torii_core::repositories::TokenRepositoryAdapter::new(
-                        repositories.clone(),
-                    )),
-                )
-                .with_event_bus(event_bus.clone()),
-            ),
+            email_verification_service: Arc::new(EmailVerificationService::new(
+                user_repo,
+                Arc::new(torii_core::repositories::TokenRepositoryAdapter::new(
+                    repositories.clone(),
+                )),
+            )),
 
             session_config: SessionConfig::default(),
         }
@@ -565,6 +614,7 @@ impl<R: RepositoryProvider> Torii<R> {
         repositories: Arc<R>,
         session_config: SessionConfig,
         brute_force_config: BruteForceProtectionConfig,
+        hook_registry: HookRegistry,
         #[cfg(feature = "mailer")] mailer_config: Option<MailerConfig>,
     ) -> Result<Self, ToriiBuilderError> {
         let event_bus = Arc::new(EventBus::new());
@@ -575,8 +625,7 @@ impl<R: RepositoryProvider> Torii<R> {
             repositories.clone(),
         ));
 
-        let user_service =
-            Arc::new(UserService::new(user_repo.clone()).with_event_bus(event_bus.clone()));
+        let user_service = Arc::new(UserService::new(user_repo.clone()));
 
         // Create session provider based on config
         let session_provider: Arc<Box<dyn SessionProvider>> = match &session_config.provider_type {
@@ -587,15 +636,13 @@ impl<R: RepositoryProvider> Torii<R> {
                 Arc::new(Box::new(JwtSessionProvider::new(jwt_config.clone())))
             }
         };
-        let session_service = Arc::new(
-            SessionService::new(session_provider.clone()).with_event_bus(event_bus.clone()),
-        );
+        let session_service = Arc::new(SessionService::new(session_provider.clone()));
 
         // Initialize brute force protection with provided config
-        let brute_force_service = Arc::new(
-            BruteForceProtectionService::new(brute_force_repo, brute_force_config)
-                .with_event_bus(event_bus.clone()),
-        );
+        let brute_force_service = Arc::new(BruteForceProtectionService::new(
+            brute_force_repo,
+            brute_force_config,
+        ));
 
         // Initialize mailer if configured - propagate errors instead of silently ignoring them
         #[cfg(feature = "mailer")]
@@ -610,40 +657,32 @@ impl<R: RepositoryProvider> Torii<R> {
         Ok(Self {
             repositories: repositories.clone(),
             event_bus: event_bus.clone(),
+            hook_registry: Arc::new(hook_registry),
             user_service,
             session_service,
             session_provider,
 
             #[cfg(feature = "password")]
-            password_service: Arc::new(
-                PasswordService::new(
-                    user_repo.clone(),
-                    Arc::new(PasswordRepositoryAdapter::new(repositories.clone())),
-                )
-                .with_event_bus(event_bus.clone()),
-            ),
+            password_service: Arc::new(PasswordService::new(
+                user_repo.clone(),
+                Arc::new(PasswordRepositoryAdapter::new(repositories.clone())),
+            )),
 
             #[cfg(feature = "oauth")]
-            oauth_service: Arc::new(
-                OAuthService::new(
-                    user_repo.clone(),
-                    Arc::new(torii_core::repositories::OAuthRepositoryAdapter::new(
-                        repositories.clone(),
-                    )),
-                )
-                .with_event_bus(event_bus.clone()),
-            ),
+            oauth_service: Arc::new(OAuthService::new(
+                user_repo.clone(),
+                Arc::new(torii_core::repositories::OAuthRepositoryAdapter::new(
+                    repositories.clone(),
+                )),
+            )),
 
             #[cfg(feature = "passkey")]
-            passkey_service: Arc::new(
-                PasskeyService::new(
-                    user_repo.clone(),
-                    Arc::new(torii_core::repositories::PasskeyRepositoryAdapter::new(
-                        repositories.clone(),
-                    )),
-                )
-                .with_event_bus(event_bus.clone()),
-            ),
+            passkey_service: Arc::new(PasskeyService::new(
+                user_repo.clone(),
+                Arc::new(torii_core::repositories::PasskeyRepositoryAdapter::new(
+                    repositories.clone(),
+                )),
+            )),
 
             #[cfg(feature = "magic-link")]
             magic_link_service: Arc::new(MagicLinkService::new(
@@ -667,15 +706,12 @@ impl<R: RepositoryProvider> Torii<R> {
 
             brute_force_service,
 
-            email_verification_service: Arc::new(
-                EmailVerificationService::new(
-                    user_repo,
-                    Arc::new(torii_core::repositories::TokenRepositoryAdapter::new(
-                        repositories.clone(),
-                    )),
-                )
-                .with_event_bus(event_bus.clone()),
-            ),
+            email_verification_service: Arc::new(EmailVerificationService::new(
+                user_repo,
+                Arc::new(torii_core::repositories::TokenRepositoryAdapter::new(
+                    repositories.clone(),
+                )),
+            )),
 
             session_config,
         })
@@ -692,6 +728,11 @@ impl<R: RepositoryProvider> Torii<R> {
     /// Access the event bus shared by this Torii instance.
     pub fn event_bus(&self) -> &Arc<EventBus> {
         &self.event_bus
+    }
+
+    /// Access the lifecycle hook registry configured for this instance.
+    pub fn hooks(&self) -> &Arc<HookRegistry> {
+        &self.hook_registry
     }
 
     /// Set the session configuration
@@ -874,15 +915,71 @@ impl<R: RepositoryProvider> Torii<R> {
         user_agent: Option<String>,
         ip_address: Option<String>,
     ) -> Result<Session, ToriiError> {
-        self.session_service
-            .create_session(
-                user_id,
+        if matches!(
+            self.session_config.provider_type,
+            SessionProviderType::Jwt(_)
+        ) {
+            let session = self
+                .session_service
+                .create_session(
+                    user_id,
+                    user_agent,
+                    ip_address,
+                    self.session_config.expires_in,
+                )
+                .await
+                .map_err(|e| ToriiError::StorageError(e.to_string()))?;
+            self.event_bus
+                .emit(&Event::SessionCreated(user_id.clone(), session.clone()))
+                .await
+                .map_err(|e| ToriiError::StorageError(e.to_string()))?;
+            return Ok(session);
+        }
+        let runner =
+            torii_core::TransactionRunnerProvider::transaction_runner(self.repositories.as_ref());
+        let session = runner
+            .run(Box::new(torii_services::CreateSessionOperation {
+                repository: Arc::new(SessionRepositoryAdapter::new(self.repositories.clone())),
+                hooks: self.hook_registry.clone(),
+                user_id: user_id.clone(),
                 user_agent,
                 ip_address,
-                self.session_config.expires_in,
-            )
+                expires_in: self.session_config.expires_in,
+            }))
             .await
-            .map_err(|e| ToriiError::StorageError(e.to_string()))
+            .map_err(|e| ToriiError::StorageError(e.to_string()))?;
+        self.event_bus
+            .emit(&Event::SessionCreated(user_id.clone(), session.clone()))
+            .await
+            .map_err(|e| ToriiError::StorageError(e.to_string()))?;
+        Ok(session)
+    }
+
+    /// Refresh a session through the provider-owned transaction runner.
+    pub async fn refresh_session(
+        &self,
+        session_id: &SessionToken,
+        duration: Duration,
+    ) -> Result<Session, ToriiError> {
+        let runner =
+            torii_core::TransactionRunnerProvider::transaction_runner(self.repositories.as_ref());
+        let session = runner
+            .run(Box::new(torii_services::RefreshSessionOperation {
+                repository: Arc::new(SessionRepositoryAdapter::new(self.repositories.clone())),
+                hooks: self.hook_registry.clone(),
+                token: session_id.clone(),
+                duration,
+            }))
+            .await
+            .map_err(|e| ToriiError::StorageError(e.to_string()))?;
+        self.event_bus
+            .emit(&Event::SessionRefreshed(
+                session.user_id.clone(),
+                session.clone(),
+            ))
+            .await
+            .map_err(|e| ToriiError::StorageError(e.to_string()))?;
+        Ok(session)
     }
 
     /// Get a session by its token
@@ -908,10 +1005,25 @@ impl<R: RepositoryProvider> Torii<R> {
     ///
     /// * `session_id`: The ID of the session to delete
     pub async fn delete_session(&self, session_id: &SessionToken) -> Result<(), ToriiError> {
-        self.session_service
-            .delete_session(session_id)
+        let runner =
+            torii_core::TransactionRunnerProvider::transaction_runner(self.repositories.as_ref());
+        let outcome = runner
+            .run(Box::new(torii_services::DeleteSessionOperation {
+                repository: Arc::new(SessionRepositoryAdapter::new(self.repositories.clone())),
+                repositories: self.repositories.clone(),
+                hooks: self.hook_registry.clone(),
+                token: session_id.clone(),
+            }))
             .await
-            .map_err(|e| ToriiError::StorageError(e.to_string()))
+            .map_err(|e| ToriiError::StorageError(e.to_string()))?;
+        self.event_bus
+            .emit(&Event::SessionDeleted(
+                outcome.session.user_id,
+                session_id.clone(),
+            ))
+            .await
+            .map_err(|e| ToriiError::StorageError(e.to_string()))?;
+        Ok(())
     }
 
     /// Delete all sessions for a user
@@ -920,10 +1032,21 @@ impl<R: RepositoryProvider> Torii<R> {
     ///
     /// * `user_id`: The ID of the user to delete sessions for
     pub async fn delete_sessions_for_user(&self, user_id: &UserId) -> Result<(), ToriiError> {
-        self.session_service
-            .delete_user_sessions(user_id)
+        let runner =
+            torii_core::TransactionRunnerProvider::transaction_runner(self.repositories.as_ref());
+        runner
+            .run(Box::new(torii_services::ClearSessionsOperation {
+                repository: Arc::new(SessionRepositoryAdapter::new(self.repositories.clone())),
+                hooks: self.hook_registry.clone(),
+                user_id: user_id.clone(),
+            }))
             .await
-            .map_err(|e| ToriiError::StorageError(e.to_string()))
+            .map_err(|e| ToriiError::StorageError(e.to_string()))?;
+        self.event_bus
+            .emit(&Event::SessionsCleared(user_id.clone()))
+            .await
+            .map_err(|e| ToriiError::StorageError(e.to_string()))?;
+        Ok(())
     }
 
     /// Mark a user's email as verified
@@ -932,10 +1055,21 @@ impl<R: RepositoryProvider> Torii<R> {
     ///
     /// * `user_id`: The ID of the user to mark as verified
     pub async fn set_user_email_verified(&self, user_id: &UserId) -> Result<(), ToriiError> {
-        self.user_service
-            .verify_email(user_id)
+        let runner =
+            torii_core::TransactionRunnerProvider::transaction_runner(self.repositories.as_ref());
+        runner
+            .run(Box::new(VerifyEmailOperation {
+                user_repository: Arc::new(UserRepositoryAdapter::new(self.repositories.clone())),
+                hooks: self.hook_registry.clone(),
+                user_id: user_id.clone(),
+            }))
             .await
-            .map_err(|e| ToriiError::StorageError(e.to_string()))
+            .map_err(|e| ToriiError::StorageError(e.to_string()))?;
+        self.event_bus
+            .emit(&Event::EmailVerified(user_id.clone()))
+            .await
+            .map_err(|e| ToriiError::StorageError(e.to_string()))?;
+        Ok(())
     }
 
     /// Delete a user
@@ -944,10 +1078,21 @@ impl<R: RepositoryProvider> Torii<R> {
     ///
     /// * `user_id`: The ID of the user to delete
     pub async fn delete_user(&self, user_id: &UserId) -> Result<(), ToriiError> {
-        self.user_service
-            .delete_user(user_id)
+        let runner =
+            torii_core::TransactionRunnerProvider::transaction_runner(self.repositories.as_ref());
+        runner
+            .run(Box::new(DeleteUserOperation {
+                user_repository: Arc::new(UserRepositoryAdapter::new(self.repositories.clone())),
+                hooks: self.hook_registry.clone(),
+                user_id: user_id.clone(),
+            }))
             .await
-            .map_err(|e| ToriiError::StorageError(e.to_string()))
+            .map_err(|e| ToriiError::StorageError(e.to_string()))?;
+        self.event_bus
+            .emit(&Event::UserDeleted(user_id.clone()))
+            .await
+            .map_err(|e| ToriiError::StorageError(e.to_string()))?;
+        Ok(())
     }
 
     /// Send an email verification token to a user
@@ -969,7 +1114,8 @@ impl<R: RepositoryProvider> Torii<R> {
         &self,
         user_id: &UserId,
         verification_url_base: &str,
-    ) -> Result<SecureToken, ToriiError> {
+    ) -> Result<SecureToken, ToriiError>
+where {
         // Get user info for the email
         let user = self
             .get_user(user_id)
@@ -977,9 +1123,23 @@ impl<R: RepositoryProvider> Torii<R> {
             .ok_or_else(|| ToriiError::AuthError("User not found".to_string()))?;
 
         // Generate the verification token
-        let token = self
-            .email_verification_service
-            .generate_token(user_id)
+        let runner =
+            torii_core::TransactionRunnerProvider::transaction_runner(self.repositories.as_ref());
+        let token = runner
+            .run(Box::new(
+                torii_services::GenerateEmailVerificationOperation {
+                    token_repository: Arc::new(TokenRepositoryAdapter::new(
+                        self.repositories.clone(),
+                    )),
+                    hooks: self.hook_registry.clone(),
+                    user_id: user_id.clone(),
+                    expires_in: chrono::Duration::minutes(15),
+                },
+            ))
+            .await
+            .map_err(|e| ToriiError::StorageError(e.to_string()))?;
+        self.event_bus
+            .emit(&Event::EmailVerificationRequested(user_id.clone()))
             .await
             .map_err(|e| ToriiError::StorageError(e.to_string()))?;
 
@@ -1019,10 +1179,28 @@ impl<R: RepositoryProvider> Torii<R> {
     ///
     /// Returns the user whose email was verified
     pub async fn verify_email_token(&self, token: &str) -> Result<User, ToriiError> {
-        self.email_verification_service
-            .verify_email(token)
+        let runner =
+            torii_core::TransactionRunnerProvider::transaction_runner(self.repositories.as_ref());
+        let user = runner
+            .run(Box::new(
+                torii_services::CompleteEmailVerificationOperation {
+                    user_repository: Arc::new(UserRepositoryAdapter::new(
+                        self.repositories.clone(),
+                    )),
+                    token_repository: Arc::new(TokenRepositoryAdapter::new(
+                        self.repositories.clone(),
+                    )),
+                    hooks: self.hook_registry.clone(),
+                    token: token.to_string(),
+                },
+            ))
             .await
-            .map_err(|e| ToriiError::AuthError(e.to_string()))
+            .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        self.event_bus
+            .emit(&Event::EmailVerified(user.id.clone()))
+            .await
+            .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        Ok(user)
     }
 
     /// Check if an email verification token is valid without consuming it
@@ -1050,7 +1228,9 @@ impl<R: RepositoryProvider> Torii<R> {
 
 /// Implementation of password-based authentication methods
 #[cfg(feature = "password")]
-impl<R: RepositoryProvider> PasswordAuth<'_, R> {
+impl<R: RepositoryProvider + torii_core::repositories::TransactionalRepositoryProvider>
+    PasswordAuth<'_, R>
+{
     /// Get reference to the underlying Torii instance
     fn torii(&self) -> &Torii<R> {
         self.torii
@@ -1068,7 +1248,10 @@ impl<R: RepositoryProvider> PasswordAuth<'_, R> {
     /// Returns the user whether newly created or already existing. This prevents
     /// user enumeration attacks by not revealing whether an email is already in use.
     /// Note: If the user already exists, their password is NOT updated.
-    pub async fn register(&self, email: &str, password: &str) -> Result<User, ToriiError> {
+    pub async fn register(&self, email: &str, password: &str) -> Result<User, ToriiError>
+    where
+        R: torii_core::repositories::TransactionalRepositoryProvider,
+    {
         self.register_with_name(email, password, None).await
     }
 
@@ -1090,13 +1273,42 @@ impl<R: RepositoryProvider> PasswordAuth<'_, R> {
         email: &str,
         password: &str,
         name: Option<&str>,
-    ) -> Result<User, ToriiError> {
+    ) -> Result<User, ToriiError>
+    where
+        R: torii_core::repositories::TransactionalRepositoryProvider,
+    {
         let torii = self.torii();
-        let user = torii
+        let registration = torii
             .password_service
-            .register_user(email, password, name.map(|n| n.to_string()))
+            .register_user_transactional(
+                &torii_core::TransactionRunnerProvider::transaction_runner(
+                    self.torii.repositories.as_ref(),
+                ),
+                self.torii.repositories.clone(),
+                self.torii.hook_registry.clone(),
+                email,
+                password,
+                name.map(|n| n.to_string()),
+            )
             .await
             .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+
+        let torii_services::PasswordRegistrationOutcome {
+            user,
+            password_created,
+        } = registration;
+        if password_created {
+            torii
+                .event_bus
+                .emit(&Event::UserCreated(user.clone()))
+                .await
+                .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+            torii
+                .event_bus
+                .emit(&Event::PasswordRegistered(user.id.clone()))
+                .await
+                .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        }
 
         // Send welcome email if mailer is configured
         #[cfg(feature = "mailer")]
@@ -1139,63 +1351,119 @@ impl<R: RepositoryProvider> PasswordAuth<'_, R> {
         password: &str,
         user_agent: Option<String>,
         ip_address: Option<String>,
-    ) -> Result<(User, Session), ToriiError> {
+    ) -> Result<(User, Session), ToriiError>
+where {
         let torii = self.torii();
 
-        // Check if account is locked before attempting authentication
-        let status = torii
-            .brute_force_service
-            .get_lockout_status(email)
-            .await
-            .map_err(|e| ToriiError::StorageError(e.to_string()))?;
-
-        if status.is_locked {
-            let retry_after = status
-                .locked_until
-                .map(|until| (until - Utc::now()).num_seconds().max(0));
-            return Err(ToriiError::AuthError(format!(
-                "Account is temporarily locked. Retry after {} seconds",
-                retry_after.unwrap_or(0)
-            )));
+        if matches!(
+            torii.session_config.provider_type,
+            SessionProviderType::Jwt(_)
+        ) {
+            let runner = torii_core::TransactionRunnerProvider::transaction_runner(
+                torii.repositories.as_ref(),
+            );
+            let user = runner
+                .run(Box::new(torii_services::AuthenticatePasswordOperation {
+                    user_repository: Arc::new(UserRepositoryAdapter::new(
+                        torii.repositories.clone(),
+                    )),
+                    password_repository: Arc::new(PasswordRepositoryAdapter::new(
+                        torii.repositories.clone(),
+                    )),
+                    hooks: torii.hook_registry.clone(),
+                    email: email.to_string(),
+                    password: password.to_string(),
+                }))
+                .await
+                .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+            let session = torii
+                .session_service
+                .create_session(
+                    &user.id,
+                    user_agent,
+                    ip_address,
+                    torii.session_config.expires_in,
+                )
+                .await
+                .map_err(|e| ToriiError::StorageError(e.to_string()))?;
+            return Ok((user, session));
         }
 
-        // Attempt authentication
-        let auth_result = torii.password_service.authenticate(email, password).await;
-
-        match auth_result {
-            Ok(user) => {
-                // Clear failed attempts on successful login
-                let _ = torii.brute_force_service.reset_attempts(email).await;
-
-                let session = torii
-                    .create_session(&user.id, user_agent, ip_address)
-                    .await?;
-
+        let runner =
+            torii_core::TransactionRunnerProvider::transaction_runner(torii.repositories.as_ref());
+        let outcome = runner
+            .run(Box::new(torii_services::CompletePasswordLoginOperation {
+                user_repository: Arc::new(UserRepositoryAdapter::new(torii.repositories.clone())),
+                password_repository: Arc::new(PasswordRepositoryAdapter::new(
+                    torii.repositories.clone(),
+                )),
+                brute_force_repository: Arc::new(BruteForceProtectionRepositoryAdapter::new(
+                    torii.repositories.clone(),
+                )),
+                session_repository: Arc::new(SessionRepositoryAdapter::new(
+                    torii.repositories.clone(),
+                )),
+                repositories: torii.repositories.clone(),
+                hooks: torii.hook_registry.clone(),
+                email: email.to_string(),
+                password: password.to_string(),
+                user_agent,
+                ip_address,
+                expires_in: torii.session_config.expires_in,
+                lockout_period: torii.brute_force_service.config().lockout_period,
+                lockout_duration: torii.brute_force_service.config().lockout_duration,
+                max_failed_attempts: torii.brute_force_service.config().max_failed_attempts,
+            }))
+            .await
+            .map_err(|e| match e {
+                torii_core::TransactionError::InvalidCredentials => {
+                    ToriiError::AuthError("Invalid credentials".to_string())
+                }
+                other => ToriiError::StorageError(other.to_string()),
+            })?;
+        match outcome {
+            torii_services::PasswordLoginOutcome::Authenticated { user, session } => {
+                torii
+                    .event_bus
+                    .emit(&Event::PasswordAuthenticated(user.id.clone()))
+                    .await
+                    .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+                torii
+                    .event_bus
+                    .emit(&Event::SessionCreated(user.id.clone(), session.clone()))
+                    .await
+                    .map_err(|e| ToriiError::AuthError(e.to_string()))?;
                 Ok((user, session))
             }
-            Err(e) => {
-                // Check if this was an invalid credentials error
-                if e.is_auth_error() {
-                    // Record failed attempt
-                    let status = torii
-                        .brute_force_service
-                        .record_failed_attempt(email, ip_address.as_deref())
+            torii_services::PasswordLoginOutcome::InvalidCredentials(details)
+            | torii_services::PasswordLoginOutcome::Locked(details) => {
+                torii
+                    .event_bus
+                    .emit(&Event::LoginFailed {
+                        email: details.email.clone(),
+                        failed_attempts: details.failed_attempts,
+                        ip_address: details.ip_address.clone(),
+                        timestamp: Utc::now(),
+                    })
+                    .await
+                    .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+                if details.locked {
+                    torii
+                        .event_bus
+                        .emit(&Event::AccountLocked {
+                            email: details.email,
+                            failed_attempts: details.failed_attempts,
+                            locked_until: details.locked_until.unwrap_or_else(Utc::now),
+                            ip_address: details.ip_address,
+                            timestamp: Utc::now(),
+                        })
                         .await
-                        .map_err(|e| ToriiError::StorageError(e.to_string()))?;
-
-                    // If now locked, return locked error
-                    if status.is_locked {
-                        let retry_after = status
-                            .locked_until
-                            .map(|until| (until - Utc::now()).num_seconds().max(0));
-                        return Err(ToriiError::AuthError(format!(
-                            "Account is temporarily locked. Retry after {} seconds",
-                            retry_after.unwrap_or(0)
-                        )));
-                    }
+                        .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+                    return Err(ToriiError::AuthError(
+                        "Account is temporarily locked".to_string(),
+                    ));
                 }
-
-                Err(ToriiError::AuthError(e.to_string()))
+                Err(ToriiError::AuthError("Invalid credentials".to_string()))
             }
         }
     }
@@ -1216,7 +1484,8 @@ impl<R: RepositoryProvider> PasswordAuth<'_, R> {
         user_id: &UserId,
         old_password: &str,
         new_password: &str,
-    ) -> Result<(), ToriiError> {
+    ) -> Result<(), ToriiError>
+where {
         let torii = self.torii();
         // Get user details before changing password for potential email notification
         let user = torii
@@ -1224,14 +1493,34 @@ impl<R: RepositoryProvider> PasswordAuth<'_, R> {
             .await?
             .ok_or_else(|| ToriiError::AuthError("User not found".to_string()))?;
 
-        torii
-            .password_service
-            .change_password(user_id, old_password, new_password)
+        let runner =
+            torii_core::TransactionRunnerProvider::transaction_runner(torii.repositories.as_ref());
+        runner
+            .run(Box::new(torii_services::CompletePasswordChangeOperation {
+                password_repository: Arc::new(PasswordRepositoryAdapter::new(
+                    torii.repositories.clone(),
+                )),
+                session_repository: Arc::new(SessionRepositoryAdapter::new(
+                    torii.repositories.clone(),
+                )),
+                repositories: torii.repositories.clone(),
+                hooks: torii.hook_registry.clone(),
+                user_id: user_id.clone(),
+                old_password: old_password.to_string(),
+                new_password: new_password.to_string(),
+            }))
             .await
             .map_err(|e| ToriiError::StorageError(e.to_string()))?;
-
-        // Remove all existing sessions for the user
-        torii.delete_sessions_for_user(user_id).await?;
+        torii
+            .event_bus
+            .emit(&Event::PasswordChanged(user_id.clone()))
+            .await
+            .map_err(|e| ToriiError::StorageError(e.to_string()))?;
+        torii
+            .event_bus
+            .emit(&Event::SessionsCleared(user_id.clone()))
+            .await
+            .map_err(|e| ToriiError::StorageError(e.to_string()))?;
 
         // Send password changed notification email if mailer is configured
         #[cfg(feature = "mailer")]
@@ -1270,11 +1559,25 @@ impl<R: RepositoryProvider> PasswordAuth<'_, R> {
         reset_url_base: &str,
     ) -> Result<(), ToriiError> {
         let torii = self.torii();
-        let result = torii
-            .password_reset_service
-            .request_password_reset(email)
+        let runner =
+            torii_core::TransactionRunnerProvider::transaction_runner(torii.repositories.as_ref());
+        let result = runner
+            .run(Box::new(torii_services::RequestPasswordResetOperation {
+                user_repository: Arc::new(UserRepositoryAdapter::new(torii.repositories.clone())),
+                token_repository: Arc::new(TokenRepositoryAdapter::new(torii.repositories.clone())),
+                hooks: torii.hook_registry.clone(),
+                email: email.to_string(),
+                expires_in: chrono::Duration::minutes(15),
+            }))
             .await
             .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        if let Some((user, _)) = &result {
+            torii
+                .event_bus
+                .emit(&Event::PasswordResetRequested(user.id.clone()))
+                .await
+                .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        }
 
         // Send password reset email if mailer is configured and user exists
         #[cfg(feature = "mailer")]
@@ -1311,11 +1614,25 @@ impl<R: RepositoryProvider> PasswordAuth<'_, R> {
         expires_in: Duration,
     ) -> Result<(), ToriiError> {
         let torii = self.torii();
-        let result = torii
-            .password_reset_service
-            .request_password_reset_with_expiration(email, expires_in)
+        let runner =
+            torii_core::TransactionRunnerProvider::transaction_runner(torii.repositories.as_ref());
+        let result = runner
+            .run(Box::new(torii_services::RequestPasswordResetOperation {
+                user_repository: Arc::new(UserRepositoryAdapter::new(torii.repositories.clone())),
+                token_repository: Arc::new(TokenRepositoryAdapter::new(torii.repositories.clone())),
+                hooks: torii.hook_registry.clone(),
+                email: email.to_string(),
+                expires_in,
+            }))
             .await
             .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        if let Some((user, _)) = &result {
+            torii
+                .event_bus
+                .emit(&Event::PasswordResetRequested(user.id.clone()))
+                .await
+                .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        }
 
         // Send password reset email if mailer is configured and user exists
         #[cfg(feature = "mailer")]
@@ -1378,19 +1695,48 @@ impl<R: RepositoryProvider> PasswordAuth<'_, R> {
         &self,
         token: &str,
         new_password: &str,
-    ) -> Result<User, ToriiError> {
+    ) -> Result<User, ToriiError>
+where {
         let torii = self.torii();
-        let user = torii
-            .password_reset_service
-            .reset_password(token, new_password)
+        let runner =
+            torii_core::TransactionRunnerProvider::transaction_runner(torii.repositories.as_ref());
+        let outcome = runner
+            .run(Box::new(torii_services::CompletePasswordResetOperation {
+                user_repository: Arc::new(UserRepositoryAdapter::new(torii.repositories.clone())),
+                password_repository: Arc::new(PasswordRepositoryAdapter::new(
+                    torii.repositories.clone(),
+                )),
+                token_repository: Arc::new(TokenRepositoryAdapter::new(torii.repositories.clone())),
+                brute_force_repository: Arc::new(BruteForceProtectionRepositoryAdapter::new(
+                    torii.repositories.clone(),
+                )),
+                session_repository: Arc::new(SessionRepositoryAdapter::new(
+                    torii.repositories.clone(),
+                )),
+                repositories: torii.repositories.clone(),
+                hooks: torii.hook_registry.clone(),
+                token: token.to_string(),
+                new_password: new_password.to_string(),
+            }))
             .await
             .map_err(|e| ToriiError::AuthError(e.to_string()))?;
-
-        // Unlock the account (clears failed login attempts)
-        let _ = torii.brute_force_service.unlock_account(&user.email).await;
-
-        // Invalidate all existing sessions for security
-        torii.delete_sessions_for_user(&user.id).await?;
+        let user = outcome.user;
+        if outcome.account_was_locked {
+            torii
+                .event_bus
+                .emit(&Event::AccountUnlocked {
+                    email: user.email.clone(),
+                    reason: torii_core::events::UnlockReason::PasswordReset,
+                    timestamp: Utc::now(),
+                })
+                .await
+                .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        }
+        torii
+            .event_bus
+            .emit(&Event::PasswordResetCompleted(user.id.clone()))
+            .await
+            .map_err(|e| ToriiError::AuthError(e.to_string()))?;
 
         // Send password changed notification email if mailer is configured
         #[cfg(feature = "mailer")]
@@ -1411,7 +1757,9 @@ impl<R: RepositoryProvider> PasswordAuth<'_, R> {
 
 /// Implementation of magic link authentication methods
 #[cfg(feature = "magic-link")]
-impl<R: RepositoryProvider> MagicLinkAuth<'_, R> {
+impl<R: RepositoryProvider + torii_core::repositories::TransactionalRepositoryProvider>
+    MagicLinkAuth<'_, R>
+{
     /// Get reference to the underlying Torii instance
     fn torii(&self) -> &Torii<R> {
         self.torii
@@ -1426,13 +1774,35 @@ impl<R: RepositoryProvider> MagicLinkAuth<'_, R> {
     /// # Returns
     ///
     /// Returns the generated magic token
-    pub async fn generate_token(&self, email: &str) -> Result<SecureToken, ToriiError> {
+    pub async fn generate_token(&self, email: &str) -> Result<SecureToken, ToriiError>
+where {
         let torii = self.torii();
-        torii
-            .magic_link_service
-            .generate_token(email)
+        let runner =
+            torii_core::TransactionRunnerProvider::transaction_runner(torii.repositories.as_ref());
+        let (token, user_created, user) = runner
+            .run(Box::new(torii_services::GenerateMagicLinkOperation {
+                user_repository: Arc::new(UserRepositoryAdapter::new(torii.repositories.clone())),
+                token_repository: Arc::new(TokenRepositoryAdapter::new(torii.repositories.clone())),
+                repositories: torii.repositories.clone(),
+                hooks: torii.hook_registry.clone(),
+                email: email.to_string(),
+                expires_in: chrono::Duration::minutes(15),
+            }))
             .await
-            .map_err(|e| ToriiError::AuthError(e.to_string()))
+            .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        if user_created {
+            torii
+                .event_bus
+                .emit(&Event::UserCreated(user.clone()))
+                .await
+                .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        }
+        torii
+            .event_bus
+            .emit(&Event::MagicLinkRequested(user.id))
+            .await
+            .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        Ok(token)
     }
 
     /// Send a magic link via email
@@ -1450,7 +1820,8 @@ impl<R: RepositoryProvider> MagicLinkAuth<'_, R> {
         &self,
         email: &str,
         magic_link_url_base: &str,
-    ) -> Result<SecureToken, ToriiError> {
+    ) -> Result<SecureToken, ToriiError>
+where {
         let token = self.generate_token(email).await?;
         let torii = self.torii();
 
@@ -1504,16 +1875,40 @@ impl<R: RepositoryProvider> MagicLinkAuth<'_, R> {
         ip_address: Option<String>,
     ) -> Result<(User, Session), ToriiError> {
         let torii = self.torii();
-        let user = torii
-            .magic_link_service
-            .verify_token(token)
+        let runner =
+            torii_core::TransactionRunnerProvider::transaction_runner(torii.repositories.as_ref());
+        let (user, session) = runner
+            .run(Box::new(
+                torii_services::CompleteMagicLinkAuthenticationOperation {
+                    user_repository: Arc::new(UserRepositoryAdapter::new(
+                        torii.repositories.clone(),
+                    )),
+                    token_repository: Arc::new(TokenRepositoryAdapter::new(
+                        torii.repositories.clone(),
+                    )),
+                    session_repository: Arc::new(SessionRepositoryAdapter::new(
+                        torii.repositories.clone(),
+                    )),
+                    repositories: torii.repositories.clone(),
+                    hooks: torii.hook_registry.clone(),
+                    token: token.to_string(),
+                    user_agent,
+                    ip_address,
+                    expires_in: torii.session_config.expires_in,
+                },
+            ))
             .await
-            .map_err(|e| ToriiError::AuthError(e.to_string()))?
-            .ok_or_else(|| ToriiError::AuthError("Invalid magic token".to_string()))?;
-
-        let session = torii
-            .create_session(&user.id, user_agent, ip_address)
-            .await?;
+            .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        torii
+            .event_bus
+            .emit(&Event::MagicLinkAuthenticated(user.id.clone()))
+            .await
+            .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        torii
+            .event_bus
+            .emit(&Event::SessionCreated(user.id.clone(), session.clone()))
+            .await
+            .map_err(|e| ToriiError::AuthError(e.to_string()))?;
 
         Ok((user, session))
     }
@@ -1521,7 +1916,9 @@ impl<R: RepositoryProvider> MagicLinkAuth<'_, R> {
 
 /// Implementation of OAuth authentication methods
 #[cfg(feature = "oauth")]
-impl<R: RepositoryProvider> OAuthAuth<'_, R> {
+impl<R: RepositoryProvider + torii_core::repositories::TransactionalRepositoryProvider>
+    OAuthAuth<'_, R>
+{
     /// Get reference to the underlying Torii instance
     fn torii(&self) -> &Torii<R> {
         self.torii
@@ -1547,11 +1944,47 @@ impl<R: RepositoryProvider> OAuthAuth<'_, R> {
         name: Option<String>,
     ) -> Result<User, ToriiError> {
         let torii = self.torii();
-        torii
-            .oauth_service
-            .get_or_create_user(provider, subject, email, name)
+        let runner =
+            torii_core::TransactionRunnerProvider::transaction_runner(torii.repositories.as_ref());
+        let result: OAuthAuthenticationResult = runner
+            .run(Box::new(AuthenticateOAuthOperation {
+                user_repository: Arc::new(UserRepositoryAdapter::new(torii.repositories.clone())),
+                oauth_repository: Arc::new(OAuthRepositoryAdapter::new(torii.repositories.clone())),
+                repositories: torii.repositories.clone(),
+                hooks: torii.hook_registry.clone(),
+                provider: provider.to_string(),
+                subject: subject.to_string(),
+                email: email.to_string(),
+                name,
+            }))
             .await
-            .map_err(|e| ToriiError::AuthError(e.to_string()))
+            .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        if result.user_created {
+            torii
+                .event_bus
+                .emit(&Event::UserCreated(result.user.clone()))
+                .await
+                .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        }
+        if result.account_linked {
+            torii
+                .event_bus
+                .emit(&Event::OAuthAccountLinked {
+                    user_id: result.user.id.clone(),
+                    provider: provider.to_string(),
+                })
+                .await
+                .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        }
+        torii
+            .event_bus
+            .emit(&Event::OAuthAuthenticated {
+                user_id: result.user.id.clone(),
+                provider: provider.to_string(),
+            })
+            .await
+            .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        Ok(result.user)
     }
 
     /// Link an existing user to an OAuth account
@@ -1572,11 +2005,27 @@ impl<R: RepositoryProvider> OAuthAuth<'_, R> {
         subject: &str,
     ) -> Result<(), ToriiError> {
         let torii = self.torii();
-        torii
-            .oauth_service
-            .link_account(user_id, provider, subject)
+        let runner =
+            torii_core::TransactionRunnerProvider::transaction_runner(torii.repositories.as_ref());
+        runner
+            .run(Box::new(torii_services::LinkOAuthAccountOperation {
+                repository: Arc::new(OAuthRepositoryAdapter::new(torii.repositories.clone())),
+                hooks: torii.hook_registry.clone(),
+                user_id: user_id.clone(),
+                provider: provider.to_string(),
+                subject: subject.to_string(),
+            }))
             .await
-            .map_err(|e| ToriiError::AuthError(e.to_string()))
+            .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        torii
+            .event_bus
+            .emit(&Event::OAuthAccountLinked {
+                user_id: user_id.clone(),
+                provider: provider.to_string(),
+            })
+            .await
+            .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        Ok(())
     }
 
     /// Get OAuth account information
@@ -1696,11 +2145,26 @@ impl<R: RepositoryProvider> OAuthAuth<'_, R> {
             ));
         }
 
-        torii
-            .oauth_service
-            .unlink_account(user_id, provider)
+        let runner =
+            torii_core::TransactionRunnerProvider::transaction_runner(torii.repositories.as_ref());
+        runner
+            .run(Box::new(torii_services::UnlinkOAuthAccountOperation {
+                repository: Arc::new(OAuthRepositoryAdapter::new(torii.repositories.clone())),
+                hooks: torii.hook_registry.clone(),
+                user_id: user_id.clone(),
+                provider: provider.to_string(),
+            }))
             .await
-            .map_err(|e| ToriiError::AuthError(e.to_string()))
+            .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        torii
+            .event_bus
+            .emit(&Event::OAuthAccountUnlinked {
+                user_id: user_id.clone(),
+                provider: provider.to_string(),
+            })
+            .await
+            .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        Ok(())
     }
 
     /// Store a PKCE verifier for OAuth flows
@@ -1721,9 +2185,15 @@ impl<R: RepositoryProvider> OAuthAuth<'_, R> {
         expires_in: chrono::Duration,
     ) -> Result<(), ToriiError> {
         let torii = self.torii();
-        torii
-            .oauth_service
-            .store_pkce_verifier(csrf_state, pkce_verifier, expires_in)
+        let runner =
+            torii_core::TransactionRunnerProvider::transaction_runner(torii.repositories.as_ref());
+        runner
+            .run(Box::new(torii_services::StorePkceOperation {
+                repository: Arc::new(OAuthRepositoryAdapter::new(torii.repositories.clone())),
+                csrf_state: csrf_state.to_string(),
+                verifier: pkce_verifier.to_string(),
+                expires_in,
+            }))
             .await
             .map_err(|e| ToriiError::AuthError(e.to_string()))
     }
@@ -1739,9 +2209,13 @@ impl<R: RepositoryProvider> OAuthAuth<'_, R> {
     /// Returns the PKCE verifier if found and valid
     pub async fn get_pkce_verifier(&self, csrf_state: &str) -> Result<Option<String>, ToriiError> {
         let torii = self.torii();
-        torii
-            .oauth_service
-            .get_pkce_verifier(csrf_state)
+        let runner =
+            torii_core::TransactionRunnerProvider::transaction_runner(torii.repositories.as_ref());
+        runner
+            .run(Box::new(torii_services::ConsumePkceOperation {
+                repository: Arc::new(OAuthRepositoryAdapter::new(torii.repositories.clone())),
+                csrf_state: csrf_state.to_string(),
+            }))
             .await
             .map_err(|e| ToriiError::AuthError(e.to_string()))
     }
@@ -1769,22 +2243,77 @@ impl<R: RepositoryProvider> OAuthAuth<'_, R> {
         user_agent: Option<String>,
         ip_address: Option<String>,
     ) -> Result<(User, Session), ToriiError> {
-        let user = self
-            .get_or_create_user(provider, subject, email, name)
-            .await?;
-
         let torii = self.torii();
-        let session = torii
-            .create_session(&user.id, user_agent, ip_address)
-            .await?;
+        let runner =
+            torii_core::TransactionRunnerProvider::transaction_runner(torii.repositories.as_ref());
+        let (result, session) = runner
+            .run(Box::new(
+                torii_services::CompleteOAuthAuthenticationOperation {
+                    user_repository: Arc::new(UserRepositoryAdapter::new(
+                        torii.repositories.clone(),
+                    )),
+                    oauth_repository: Arc::new(OAuthRepositoryAdapter::new(
+                        torii.repositories.clone(),
+                    )),
+                    session_repository: Arc::new(SessionRepositoryAdapter::new(
+                        torii.repositories.clone(),
+                    )),
+                    repositories: torii.repositories.clone(),
+                    hooks: torii.hook_registry.clone(),
+                    provider: provider.to_string(),
+                    subject: subject.to_string(),
+                    email: email.to_string(),
+                    name,
+                    user_agent,
+                    ip_address,
+                    expires_in: torii.session_config.expires_in,
+                },
+            ))
+            .await
+            .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        if result.user_created {
+            torii
+                .event_bus
+                .emit(&Event::UserCreated(result.user.clone()))
+                .await
+                .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        }
+        if result.account_linked {
+            torii
+                .event_bus
+                .emit(&Event::OAuthAccountLinked {
+                    user_id: result.user.id.clone(),
+                    provider: provider.to_string(),
+                })
+                .await
+                .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        }
+        torii
+            .event_bus
+            .emit(&Event::OAuthAuthenticated {
+                user_id: result.user.id.clone(),
+                provider: provider.to_string(),
+            })
+            .await
+            .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        torii
+            .event_bus
+            .emit(&Event::SessionCreated(
+                result.user.id.clone(),
+                session.clone(),
+            ))
+            .await
+            .map_err(|e| ToriiError::AuthError(e.to_string()))?;
 
-        Ok((user, session))
+        Ok((result.user, session))
     }
 }
 
 /// Implementation of Passkey authentication methods
 #[cfg(feature = "passkey")]
-impl<R: RepositoryProvider> PasskeyAuth<'_, R> {
+impl<R: RepositoryProvider + torii_core::repositories::TransactionalRepositoryProvider>
+    PasskeyAuth<'_, R>
+{
     /// Get reference to the underlying Torii instance
     fn torii(&self) -> &Torii<R> {
         self.torii
@@ -1810,11 +2339,25 @@ impl<R: RepositoryProvider> PasskeyAuth<'_, R> {
         name: Option<String>,
     ) -> Result<torii_core::repositories::PasskeyCredential, ToriiError> {
         let torii = self.torii();
-        torii
-            .passkey_service
-            .register_credential(user_id, credential_id, public_key, name)
+        let runner =
+            torii_core::TransactionRunnerProvider::transaction_runner(torii.repositories.as_ref());
+        let credential = runner
+            .run(Box::new(torii_services::RegisterPasskeyOperation {
+                repository: Arc::new(PasskeyRepositoryAdapter::new(torii.repositories.clone())),
+                hooks: torii.hook_registry.clone(),
+                user_id: user_id.clone(),
+                credential_id,
+                public_key,
+                name,
+            }))
             .await
-            .map_err(|e| ToriiError::AuthError(e.to_string()))
+            .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        torii
+            .event_bus
+            .emit(&Event::PasskeyRegistered(user_id.clone()))
+            .await
+            .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        Ok(credential)
     }
 
     /// Get all passkey credentials for a user
@@ -1877,16 +2420,38 @@ impl<R: RepositoryProvider> PasskeyAuth<'_, R> {
         ip_address: Option<String>,
     ) -> Result<(User, Session), ToriiError> {
         let torii = self.torii();
-        let user = torii
-            .passkey_service
-            .authenticate_credential(credential_id)
+        let runner =
+            torii_core::TransactionRunnerProvider::transaction_runner(torii.repositories.as_ref());
+        let (user, session) = runner
+            .run(Box::new(
+                torii_services::CompletePasskeyAuthenticationOperation {
+                    user_repository: Arc::new(UserRepositoryAdapter::new(
+                        torii.repositories.clone(),
+                    )),
+                    repository: Arc::new(PasskeyRepositoryAdapter::new(torii.repositories.clone())),
+                    session_repository: Arc::new(SessionRepositoryAdapter::new(
+                        torii.repositories.clone(),
+                    )),
+                    repositories: torii.repositories.clone(),
+                    hooks: torii.hook_registry.clone(),
+                    credential_id: credential_id.to_vec(),
+                    user_agent,
+                    ip_address,
+                    expires_in: torii.session_config.expires_in,
+                },
+            ))
             .await
-            .map_err(|e| ToriiError::AuthError(e.to_string()))?
-            .ok_or_else(|| ToriiError::AuthError("Invalid passkey credential".to_string()))?;
-
-        let session = torii
-            .create_session(&user.id, user_agent, ip_address)
-            .await?;
+            .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        torii
+            .event_bus
+            .emit(&Event::PasskeyAuthenticated(user.id.clone()))
+            .await
+            .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        torii
+            .event_bus
+            .emit(&Event::SessionCreated(user.id.clone(), session.clone()))
+            .await
+            .map_err(|e| ToriiError::AuthError(e.to_string()))?;
 
         Ok((user, session))
     }
@@ -1902,11 +2467,30 @@ impl<R: RepositoryProvider> PasskeyAuth<'_, R> {
     /// Returns Ok() if the credential is deleted successfully
     pub async fn delete_credential(&self, credential_id: &[u8]) -> Result<(), ToriiError> {
         let torii = self.torii();
-        torii
+        let user_id = torii
             .passkey_service
-            .delete_credential(credential_id)
+            .get_credential(credential_id)
             .await
-            .map_err(|e| ToriiError::AuthError(e.to_string()))
+            .map_err(|e| ToriiError::AuthError(e.to_string()))?
+            .map(|credential| credential.user_id)
+            .ok_or_else(|| ToriiError::AuthError("Passkey credential not found".to_string()))?;
+        let runner =
+            torii_core::TransactionRunnerProvider::transaction_runner(torii.repositories.as_ref());
+        runner
+            .run(Box::new(torii_services::RemovePasskeyOperation {
+                repository: Arc::new(PasskeyRepositoryAdapter::new(torii.repositories.clone())),
+                hooks: torii.hook_registry.clone(),
+                user_id: user_id.clone(),
+                credential_id: credential_id.to_vec(),
+            }))
+            .await
+            .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        torii
+            .event_bus
+            .emit(&Event::PasskeyRemoved(user_id))
+            .await
+            .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        Ok(())
     }
 
     /// Delete all passkey credentials for a user
@@ -1920,11 +2504,22 @@ impl<R: RepositoryProvider> PasskeyAuth<'_, R> {
     /// Returns Ok() if all credentials are deleted successfully
     pub async fn delete_user_credentials(&self, user_id: &UserId) -> Result<(), ToriiError> {
         let torii = self.torii();
-        torii
-            .passkey_service
-            .delete_user_credentials(user_id)
+        let runner =
+            torii_core::TransactionRunnerProvider::transaction_runner(torii.repositories.as_ref());
+        runner
+            .run(Box::new(torii_services::RemoveUserPasskeysOperation {
+                repository: Arc::new(PasskeyRepositoryAdapter::new(torii.repositories.clone())),
+                hooks: torii.hook_registry.clone(),
+                user_id: user_id.clone(),
+            }))
             .await
-            .map_err(|e| ToriiError::AuthError(e.to_string()))
+            .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        torii
+            .event_bus
+            .emit(&Event::PasskeyRemoved(user_id.clone()))
+            .await
+            .map_err(|e| ToriiError::AuthError(e.to_string()))?;
+        Ok(())
     }
 }
 

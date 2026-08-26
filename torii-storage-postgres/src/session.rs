@@ -9,6 +9,16 @@ mod test {
     use torii_core::session::SessionToken;
     use torii_core::{Session, UserId};
 
+    async fn delete_session(storage: &crate::PostgresStorage, token: &SessionToken) {
+        let transaction = storage.pool.begin().await.unwrap();
+        let mut adapter = crate::PostgresTransactionAdapter { transaction };
+        PostgresSessionRepository::new(storage.pool.clone())
+            .delete(&mut adapter, token)
+            .await
+            .unwrap();
+        adapter.transaction.commit().await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_postgres_storage() {
         let storage = setup_test_db().await;
@@ -30,10 +40,13 @@ mod test {
             format!("test{user_id}@example.com")
         );
 
+        let transaction = storage.pool.begin().await.unwrap();
+        let mut adapter = crate::PostgresTransactionAdapter { transaction };
         user_repo
-            .delete(&user_id)
+            .delete(&mut adapter, &user_id)
             .await
             .expect("Failed to delete user");
+        adapter.transaction.commit().await.unwrap();
         let deleted = user_repo
             .find_by_id(&user_id)
             .await
@@ -67,10 +80,7 @@ mod test {
         assert!(fetched.is_some());
         assert_eq!(fetched.unwrap().user_id, user_id);
 
-        session_repo
-            .delete(&session_token)
-            .await
-            .expect("Failed to delete session");
+        delete_session(&storage, &session_token).await;
         let deleted = session_repo
             .find_by_token(&session_token)
             .await
@@ -96,8 +106,7 @@ mod test {
             .build()
             .unwrap();
 
-        session_repo
-            .create(expired_session.clone())
+        crate::tests::create_test_session_value(&storage, expired_session.clone())
             .await
             .expect("Failed to create expired session");
 
@@ -185,10 +194,13 @@ mod test {
         .expect("Failed to create session 3");
 
         // Delete all sessions for user 1
+        let transaction = storage.pool.begin().await.unwrap();
+        let mut adapter = crate::PostgresTransactionAdapter { transaction };
         session_repo
-            .delete_by_user_id(&user_id1)
+            .delete_by_user_id(&mut adapter, &user_id1)
             .await
             .expect("Failed to delete sessions for user");
+        adapter.transaction.commit().await.unwrap();
 
         // Verify user 1's sessions are deleted
         let session1 = session_repo

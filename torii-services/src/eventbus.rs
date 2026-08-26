@@ -27,22 +27,6 @@ pub async fn emit_if_configured(
     Ok(())
 }
 
-/// Provides the shared event-emission behavior for a service.
-#[async_trait]
-pub trait EventEmitter {
-    /// Return the event bus configured for this service, if any.
-    fn event_bus(&self) -> Option<&Arc<EventBus>>;
-
-    /// Emit an event when this service has an event bus configured.
-    async fn emit_event(&self, event: Event) -> Result<(), EventError> {
-        if let Some(event_bus) = self.event_bus() {
-            event_bus.emit(&event).await?;
-        }
-
-        Ok(())
-    }
-}
-
 /// Event bus that can emit events and register event handlers
 ///
 /// The event bus is responsible for managing event handlers and emitting events to them.
@@ -223,6 +207,18 @@ mod tests {
 
     struct ErroringEventHandler;
 
+    struct CollectingEventHandler {
+        events: Arc<tokio::sync::Mutex<Vec<Event>>>,
+    }
+
+    #[async_trait]
+    impl EventHandler for CollectingEventHandler {
+        async fn handle_event(&self, event: &Event) -> Result<(), EventError> {
+            self.events.lock().await.push(event.clone());
+            Ok(())
+        }
+    }
+
     #[async_trait]
     impl EventHandler for ErroringEventHandler {
         async fn handle_event(&self, _event: &Event) -> Result<(), EventError> {
@@ -342,6 +338,35 @@ mod tests {
         event_bus.emit(&Event::UserCreated(user)).await.unwrap();
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn collecting_handler_observes_registration_events() {
+        let event_bus = EventBus::default();
+        let events = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        event_bus
+            .register(Arc::new(CollectingEventHandler {
+                events: events.clone(),
+            }))
+            .await;
+
+        let user = User::builder()
+            .id(UserId::new("registration-test"))
+            .email("registration@example.com".to_string())
+            .build()
+            .unwrap();
+        event_bus
+            .emit(&Event::UserCreated(user.clone()))
+            .await
+            .unwrap();
+        event_bus
+            .emit(&Event::PasswordRegistered(user.id.clone()))
+            .await
+            .unwrap();
+
+        let events = events.lock().await;
+        assert!(matches!(events.first(), Some(Event::UserCreated(_))));
+        assert!(matches!(events.get(1), Some(Event::PasswordRegistered(_))));
     }
 
     #[tokio::test]

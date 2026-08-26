@@ -1,5 +1,6 @@
 //! SQLite implementation of the brute force protection repository.
 
+use crate::SqliteTransactionAdapter;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
@@ -53,10 +54,17 @@ struct SqliteAttemptStats {
 impl BruteForceProtectionRepository for SqliteBruteForceRepository {
     async fn record_failed_attempt(
         &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
         email: &str,
         ip_address: Option<&str>,
     ) -> Result<FailedLoginAttempt, Error> {
         let now = Utc::now().timestamp();
+        let adapter = transaction
+            .as_any_mut()
+            .downcast_mut::<SqliteTransactionAdapter>()
+            .ok_or_else(|| {
+                StorageError::Database("SQLite transaction adapter required".to_string())
+            })?;
 
         let row = sqlx::query_as::<_, SqliteFailedLoginAttempt>(
             r#"
@@ -68,7 +76,7 @@ impl BruteForceProtectionRepository for SqliteBruteForceRepository {
         .bind(email)
         .bind(ip_address)
         .bind(now)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *adapter.transaction)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "Failed to record failed login attempt");
@@ -109,10 +117,20 @@ impl BruteForceProtectionRepository for SqliteBruteForceRepository {
         })
     }
 
-    async fn clear_attempts(&self, email: &str) -> Result<u64, Error> {
+    async fn clear_attempts(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        email: &str,
+    ) -> Result<u64, Error> {
+        let adapter = transaction
+            .as_any_mut()
+            .downcast_mut::<SqliteTransactionAdapter>()
+            .ok_or_else(|| {
+                StorageError::Database("SQLite transaction adapter required".to_string())
+            })?;
         let result = sqlx::query("DELETE FROM failed_login_attempts WHERE email = ?")
             .bind(email)
-            .execute(&self.pool)
+            .execute(&mut *adapter.transaction)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "Failed to clear attempts");
@@ -149,16 +167,23 @@ impl BruteForceProtectionRepository for SqliteBruteForceRepository {
 
     async fn set_locked_at(
         &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
         email: &str,
         locked_at: Option<DateTime<Utc>>,
     ) -> Result<(), Error> {
         let locked_at_timestamp = locked_at.map(|dt| dt.timestamp());
 
         // Update if user exists, ignore if not (prevents enumeration)
+        let adapter = transaction
+            .as_any_mut()
+            .downcast_mut::<SqliteTransactionAdapter>()
+            .ok_or_else(|| {
+                StorageError::Database("SQLite transaction adapter required".to_string())
+            })?;
         sqlx::query("UPDATE users SET locked_at = ? WHERE email = ?")
             .bind(locked_at_timestamp)
             .bind(email)
-            .execute(&self.pool)
+            .execute(&mut *adapter.transaction)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "Failed to set locked_at");
@@ -237,13 +262,97 @@ mod tests {
             .expect("Failed to create test user");
     }
 
+    async fn record_attempt(
+        pool: &SqlitePool,
+        repo: &SqliteBruteForceRepository,
+        email: &str,
+        ip_address: Option<&str>,
+    ) -> Result<FailedLoginAttempt, Error> {
+        let transaction = pool
+            .begin()
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let mut adapter = crate::SqliteTransactionAdapter { transaction };
+        let result = repo
+            .record_failed_attempt(&mut adapter, email, ip_address)
+            .await;
+        match result {
+            Ok(attempt) => {
+                adapter
+                    .transaction
+                    .commit()
+                    .await
+                    .map_err(|e| StorageError::Database(e.to_string()))?;
+                Ok(attempt)
+            }
+            Err(error) => {
+                let _ = adapter.transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn clear_attempts(
+        pool: &SqlitePool,
+        repo: &SqliteBruteForceRepository,
+        email: &str,
+    ) -> Result<u64, Error> {
+        let transaction = pool
+            .begin()
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let mut adapter = crate::SqliteTransactionAdapter { transaction };
+        let result = repo.clear_attempts(&mut adapter, email).await;
+        match result {
+            Ok(cleared) => {
+                adapter
+                    .transaction
+                    .commit()
+                    .await
+                    .map_err(|e| StorageError::Database(e.to_string()))?;
+                Ok(cleared)
+            }
+            Err(error) => {
+                let _ = adapter.transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn set_locked_at(
+        pool: &SqlitePool,
+        repo: &SqliteBruteForceRepository,
+        email: &str,
+        locked_at: Option<chrono::DateTime<Utc>>,
+    ) -> Result<(), Error> {
+        let transaction = pool
+            .begin()
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let mut adapter = crate::SqliteTransactionAdapter { transaction };
+        let result = repo.set_locked_at(&mut adapter, email, locked_at).await;
+        match result {
+            Ok(()) => {
+                adapter
+                    .transaction
+                    .commit()
+                    .await
+                    .map_err(|e| StorageError::Database(e.to_string()))?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = adapter.transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_record_failed_attempt() {
         let pool = setup_test_db().await;
-        let repo = SqliteBruteForceRepository::new(pool);
+        let repo = SqliteBruteForceRepository::new(pool.clone());
 
-        let attempt = repo
-            .record_failed_attempt("test@example.com", Some("192.168.1.1"))
+        let attempt = record_attempt(&pool, &repo, "test@example.com", Some("192.168.1.1"))
             .await
             .expect("Failed to record attempt");
 
@@ -255,11 +364,11 @@ mod tests {
     #[tokio::test]
     async fn test_get_attempt_stats() {
         let pool = setup_test_db().await;
-        let repo = SqliteBruteForceRepository::new(pool);
+        let repo = SqliteBruteForceRepository::new(pool.clone());
 
         // Record multiple attempts
         for _ in 0..3 {
-            repo.record_failed_attempt("test@example.com", None)
+            record_attempt(&pool, &repo, "test@example.com", None)
                 .await
                 .expect("Failed to record attempt");
         }
@@ -276,10 +385,10 @@ mod tests {
     #[tokio::test]
     async fn test_get_attempt_stats_respects_since() {
         let pool = setup_test_db().await;
-        let repo = SqliteBruteForceRepository::new(pool);
+        let repo = SqliteBruteForceRepository::new(pool.clone());
 
         // Record an attempt
-        repo.record_failed_attempt("test@example.com", None)
+        record_attempt(&pool, &repo, "test@example.com", None)
             .await
             .expect("Failed to record attempt");
 
@@ -296,20 +405,22 @@ mod tests {
     #[tokio::test]
     async fn test_clear_attempts() {
         let pool = setup_test_db().await;
-        let repo = SqliteBruteForceRepository::new(pool);
+        let repo = SqliteBruteForceRepository::new(pool.clone());
 
         // Record attempts for two emails
         for _ in 0..3 {
-            repo.record_failed_attempt("test1@example.com", None)
+            record_attempt(&pool, &repo, "test1@example.com", None)
                 .await
                 .unwrap();
-            repo.record_failed_attempt("test2@example.com", None)
+            record_attempt(&pool, &repo, "test2@example.com", None)
                 .await
                 .unwrap();
         }
 
         // Clear attempts for one email
-        let cleared = repo.clear_attempts("test1@example.com").await.unwrap();
+        let cleared = clear_attempts(&pool, &repo, "test1@example.com")
+            .await
+            .unwrap();
         assert_eq!(cleared, 3);
 
         // Verify test1 has no attempts
@@ -331,7 +442,7 @@ mod tests {
     async fn test_set_and_get_locked_at() {
         let pool = setup_test_db().await;
         create_test_user(&pool, "test@example.com").await;
-        let repo = SqliteBruteForceRepository::new(pool);
+        let repo = SqliteBruteForceRepository::new(pool.clone());
 
         // Initially should be None
         let locked_at = repo.get_locked_at("test@example.com").await.unwrap();
@@ -339,7 +450,7 @@ mod tests {
 
         // Set locked_at
         let now = Utc::now();
-        repo.set_locked_at("test@example.com", Some(now))
+        set_locked_at(&pool, &repo, "test@example.com", Some(now))
             .await
             .unwrap();
 
@@ -348,7 +459,9 @@ mod tests {
         assert!(locked_at.is_some());
 
         // Clear locked_at
-        repo.set_locked_at("test@example.com", None).await.unwrap();
+        set_locked_at(&pool, &repo, "test@example.com", None)
+            .await
+            .unwrap();
 
         // Should be None again
         let locked_at = repo.get_locked_at("test@example.com").await.unwrap();
@@ -358,12 +471,10 @@ mod tests {
     #[tokio::test]
     async fn test_set_locked_at_nonexistent_user() {
         let pool = setup_test_db().await;
-        let repo = SqliteBruteForceRepository::new(pool);
+        let repo = SqliteBruteForceRepository::new(pool.clone());
 
         // Should not error for non-existent user
-        let result = repo
-            .set_locked_at("nonexistent@example.com", Some(Utc::now()))
-            .await;
+        let result = set_locked_at(&pool, &repo, "nonexistent@example.com", Some(Utc::now())).await;
         assert!(result.is_ok());
     }
 
@@ -372,18 +483,18 @@ mod tests {
         let pool = setup_test_db().await;
         create_test_user(&pool, "locked@example.com").await;
         create_test_user(&pool, "unlocked@example.com").await;
-        let repo = SqliteBruteForceRepository::new(pool);
+        let repo = SqliteBruteForceRepository::new(pool.clone());
 
         // Record old attempts for both users
-        repo.record_failed_attempt("locked@example.com", None)
+        record_attempt(&pool, &repo, "locked@example.com", None)
             .await
             .unwrap();
-        repo.record_failed_attempt("unlocked@example.com", None)
+        record_attempt(&pool, &repo, "unlocked@example.com", None)
             .await
             .unwrap();
 
         // Lock one user
-        repo.set_locked_at("locked@example.com", Some(Utc::now()))
+        set_locked_at(&pool, &repo, "locked@example.com", Some(Utc::now()))
             .await
             .unwrap();
 

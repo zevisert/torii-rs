@@ -1,4 +1,4 @@
-use crate::{Error, UserId};
+use crate::{Error, UserId, transaction::TransactionAdapter};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
@@ -19,6 +19,7 @@ pub trait PasskeyRepository: Send + Sync + 'static {
     /// Add a passkey credential for a user
     async fn add_credential(
         &self,
+        transaction: &mut dyn TransactionAdapter,
         user_id: &UserId,
         credential_id: Vec<u8>,
         public_key: Vec<u8>,
@@ -38,11 +39,23 @@ pub trait PasskeyRepository: Send + Sync + 'static {
     ) -> Result<Option<PasskeyCredential>, Error>;
 
     /// Update the last used timestamp for a credential
-    async fn update_last_used(&self, credential_id: &[u8]) -> Result<(), Error>;
+    async fn update_last_used(
+        &self,
+        transaction: &mut dyn TransactionAdapter,
+        credential_id: &[u8],
+    ) -> Result<(), Error>;
 
     /// Delete a passkey credential
-    async fn delete_credential(&self, credential_id: &[u8]) -> Result<(), Error>;
+    async fn delete_credential(
+        &self,
+        transaction: &mut dyn TransactionAdapter,
+        credential_id: &[u8],
+    ) -> Result<(), Error>;
 
     /// Delete all passkey credentials for a user
-    async fn delete_all_for_user(&self, user_id: &UserId) -> Result<(), Error>;
+    async fn delete_all_for_user(
+        &self,
+        transaction: &mut dyn TransactionAdapter,
+        user_id: &UserId,
+    ) -> Result<(), Error>;
 }

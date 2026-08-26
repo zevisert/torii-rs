@@ -65,6 +65,17 @@ impl SqliteRepositoryProvider {
             brute_force,
         }
     }
+
+    pub fn database_pool(&self) -> SqlitePool {
+        self.pool.clone()
+    }
+
+    pub fn user_repository(&self) -> Arc<SqliteUserRepository> {
+        self.user.clone()
+    }
+    pub fn password_repository(&self) -> Arc<SqlitePasswordRepository> {
+        self.password.clone()
+    }
 }
 
 // Implement individual provider traits

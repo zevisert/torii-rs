@@ -1,6 +1,7 @@
 use crate::{
     Error, UserId,
     storage::{SecureToken, TokenPurpose},
+    transaction::TransactionAdapter,
 };
 use async_trait::async_trait;
 use chrono::Duration;
@@ -11,6 +12,7 @@ pub trait TokenRepository: Send + Sync + 'static {
     /// Create a new secure token for a specific purpose
     async fn create_token(
         &self,
+        transaction: &mut dyn TransactionAdapter,
         user_id: &UserId,
         purpose: TokenPurpose,
         expires_in: Duration,
@@ -22,6 +24,7 @@ pub trait TokenRepository: Send + Sync + 'static {
     /// providing security isolation between different token types.
     async fn verify_token(
         &self,
+        transaction: &mut dyn TransactionAdapter,
         token: &str,
         purpose: TokenPurpose,
     ) -> Result<Option<SecureToken>, Error>;

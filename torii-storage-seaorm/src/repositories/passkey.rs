@@ -7,8 +7,22 @@ use torii_core::{
     repositories::{PasskeyCredential, PasskeyRepository},
 };
 
-use crate::SeaORMStorageError;
 use crate::entities::{passkey, passkey_challenge};
+use crate::{SeaORMStorageError, SeaORMTransactionAdapter};
+
+fn seaorm_transaction(
+    value: &mut dyn torii_core::TransactionAdapter,
+) -> Result<&sea_orm::DatabaseTransaction, Error> {
+    value
+        .as_any_mut()
+        .downcast_mut::<SeaORMTransactionAdapter>()
+        .map(|adapter| adapter.transaction())
+        .ok_or_else(|| {
+            Error::Storage(torii_core::error::StorageError::Database(
+                "SeaORM transaction adapter required".into(),
+            ))
+        })
+}
 
 pub struct SeaORMPasskeyRepository {
     pool: DatabaseConnection,
@@ -24,6 +38,7 @@ impl SeaORMPasskeyRepository {
 impl PasskeyRepository for SeaORMPasskeyRepository {
     async fn add_credential(
         &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
         user_id: &UserId,
         credential_id: Vec<u8>,
         public_key: Vec<u8>,
@@ -50,7 +65,7 @@ impl PasskeyRepository for SeaORMPasskeyRepository {
         };
 
         passkey_model
-            .insert(&self.pool)
+            .insert(seaorm_transaction(transaction)?)
             .await
             .map_err(SeaORMStorageError::Database)?;
 
@@ -149,14 +164,18 @@ impl PasskeyRepository for SeaORMPasskeyRepository {
         }
     }
 
-    async fn update_last_used(&self, credential_id: &[u8]) -> Result<(), Error> {
+    async fn update_last_used(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        credential_id: &[u8],
+    ) -> Result<(), Error> {
         use base64::prelude::*;
 
         let credential_id_b64 = BASE64_STANDARD.encode(credential_id);
 
         let passkey = passkey::Entity::find()
             .filter(passkey::Column::CredentialId.eq(&credential_id_b64))
-            .one(&self.pool)
+            .one(seaorm_transaction(transaction)?)
             .await
             .map_err(SeaORMStorageError::Database)?;
 
@@ -170,7 +189,7 @@ impl PasskeyRepository for SeaORMPasskeyRepository {
             let mut active: passkey::ActiveModel = p.into();
             active.data_json = Set(json.to_string());
             active
-                .update(&self.pool)
+                .update(seaorm_transaction(transaction)?)
                 .await
                 .map_err(SeaORMStorageError::Database)?;
         }
@@ -178,24 +197,32 @@ impl PasskeyRepository for SeaORMPasskeyRepository {
         Ok(())
     }
 
-    async fn delete_credential(&self, credential_id: &[u8]) -> Result<(), Error> {
+    async fn delete_credential(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        credential_id: &[u8],
+    ) -> Result<(), Error> {
         use base64::prelude::*;
 
         let credential_id_b64 = BASE64_STANDARD.encode(credential_id);
 
         passkey::Entity::delete_many()
             .filter(passkey::Column::CredentialId.eq(&credential_id_b64))
-            .exec(&self.pool)
+            .exec(seaorm_transaction(transaction)?)
             .await
             .map_err(SeaORMStorageError::Database)?;
 
         Ok(())
     }
 
-    async fn delete_all_for_user(&self, user_id: &UserId) -> Result<(), Error> {
+    async fn delete_all_for_user(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        user_id: &UserId,
+    ) -> Result<(), Error> {
         passkey::Entity::delete_many()
             .filter(passkey::Column::UserId.eq(user_id.to_string()))
-            .exec(&self.pool)
+            .exec(seaorm_transaction(transaction)?)
             .await
             .map_err(SeaORMStorageError::Database)?;
 
@@ -241,9 +268,11 @@ impl SeaORMPasskeyRepository {
 mod tests {
     use super::*;
     use crate::migrations::Migrator;
-    use crate::repositories::SeaORMUserRepository;
-    use sea_orm::Database;
+    use crate::{SeaORMTransactionAdapter, repositories::SeaORMTransaction};
+    use sea_orm::{Database, TransactionTrait};
     use sea_orm_migration::MigratorTrait;
+    use torii_core::repositories::{TransactionRepositoryView, TransactionUserRepository};
+    use torii_core::storage::NewUser;
 
     async fn setup_test_db() -> DatabaseConnection {
         let pool = Database::connect("sqlite::memory:").await.unwrap();
@@ -251,12 +280,24 @@ mod tests {
         pool
     }
 
+    async fn begin_transaction(pool: &DatabaseConnection) -> SeaORMTransactionAdapter {
+        SeaORMTransactionAdapter::new(pool.begin().await.unwrap())
+    }
+
     async fn create_test_user(pool: &DatabaseConnection) -> UserId {
-        let repo = SeaORMUserRepository::new(pool.clone());
-        let user = repo
-            .create_user("test@example.com", Some("Test User"))
+        let mut transaction = begin_transaction(pool).await;
+        let mut view = SeaORMTransaction::new(&mut transaction).unwrap();
+        let user = view
+            .users()
+            .create(NewUser {
+                id: UserId::new_random(),
+                email: "test@example.com".to_string(),
+                name: Some("Test User".to_string()),
+                email_verified_at: None,
+            })
             .await
             .unwrap();
+        transaction.into_inner().commit().await.unwrap();
         user.id
     }
 
@@ -270,8 +311,10 @@ mod tests {
         let public_key = vec![6, 7, 8, 9, 10];
         let name = Some("Test Passkey".to_string());
 
+        let mut transaction = begin_transaction(&pool).await;
         let credential = repo
             .add_credential(
+                &mut transaction,
                 &user_id,
                 credential_id.clone(),
                 public_key.clone(),
@@ -279,6 +322,7 @@ mod tests {
             )
             .await
             .unwrap();
+        transaction.into_inner().commit().await.unwrap();
 
         assert_eq!(credential.user_id, user_id);
         assert_eq!(credential.credential_id, credential_id);
@@ -300,9 +344,17 @@ mod tests {
         let credential_id = vec![1, 2, 3, 4, 5];
         let public_key = vec![6, 7, 8, 9, 10];
 
-        repo.add_credential(&user_id, credential_id.clone(), public_key.clone(), None)
-            .await
-            .unwrap();
+        let mut transaction = begin_transaction(&pool).await;
+        repo.add_credential(
+            &mut transaction,
+            &user_id,
+            credential_id.clone(),
+            public_key.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        transaction.into_inner().commit().await.unwrap();
 
         let credential = repo.get_credential(&credential_id).await.unwrap();
         assert!(credential.is_some());
@@ -318,16 +370,28 @@ mod tests {
         let credential_id = vec![1, 2, 3, 4, 5];
         let public_key = vec![6, 7, 8, 9, 10];
 
-        repo.add_credential(&user_id, credential_id.clone(), public_key, None)
-            .await
-            .unwrap();
+        let mut transaction = begin_transaction(&pool).await;
+        repo.add_credential(
+            &mut transaction,
+            &user_id,
+            credential_id.clone(),
+            public_key,
+            None,
+        )
+        .await
+        .unwrap();
+        transaction.into_inner().commit().await.unwrap();
 
         // Verify it exists
         let credential = repo.get_credential(&credential_id).await.unwrap();
         assert!(credential.is_some());
 
         // Delete it
-        repo.delete_credential(&credential_id).await.unwrap();
+        let mut transaction = begin_transaction(&pool).await;
+        repo.delete_credential(&mut transaction, &credential_id)
+            .await
+            .unwrap();
+        transaction.into_inner().commit().await.unwrap();
 
         // Verify it's gone
         let credential = repo.get_credential(&credential_id).await.unwrap();
@@ -341,18 +405,36 @@ mod tests {
         let user_id = create_test_user(&pool).await;
 
         // Add multiple credentials
-        repo.add_credential(&user_id, vec![1, 2, 3], vec![4, 5, 6], None)
-            .await
-            .unwrap();
-        repo.add_credential(&user_id, vec![7, 8, 9], vec![10, 11, 12], None)
-            .await
-            .unwrap();
+        let mut transaction = begin_transaction(&pool).await;
+        repo.add_credential(
+            &mut transaction,
+            &user_id,
+            vec![1, 2, 3],
+            vec![4, 5, 6],
+            None,
+        )
+        .await
+        .unwrap();
+        repo.add_credential(
+            &mut transaction,
+            &user_id,
+            vec![7, 8, 9],
+            vec![10, 11, 12],
+            None,
+        )
+        .await
+        .unwrap();
+        transaction.into_inner().commit().await.unwrap();
 
         let credentials = repo.get_credentials_for_user(&user_id).await.unwrap();
         assert_eq!(credentials.len(), 2);
 
         // Delete all
-        repo.delete_all_for_user(&user_id).await.unwrap();
+        let mut transaction = begin_transaction(&pool).await;
+        repo.delete_all_for_user(&mut transaction, &user_id)
+            .await
+            .unwrap();
+        transaction.into_inner().commit().await.unwrap();
 
         let credentials = repo.get_credentials_for_user(&user_id).await.unwrap();
         assert_eq!(credentials.len(), 0);
@@ -368,16 +450,28 @@ mod tests {
         let public_key = vec![6, 7, 8, 9, 10];
 
         // Create a credential
+        let mut transaction = begin_transaction(&pool).await;
         let credential = repo
-            .add_credential(&user_id, credential_id.clone(), public_key, None)
+            .add_credential(
+                &mut transaction,
+                &user_id,
+                credential_id.clone(),
+                public_key,
+                None,
+            )
             .await
             .unwrap();
+        transaction.into_inner().commit().await.unwrap();
 
         // Initially, last_used_at should be None
         assert!(credential.last_used_at.is_none());
 
         // Update last used
-        repo.update_last_used(&credential_id).await.unwrap();
+        let mut transaction = begin_transaction(&pool).await;
+        repo.update_last_used(&mut transaction, &credential_id)
+            .await
+            .unwrap();
+        transaction.into_inner().commit().await.unwrap();
 
         // Fetch the credential again and verify last_used_at is set
         let updated_credential = repo.get_credential(&credential_id).await.unwrap();

@@ -55,9 +55,17 @@ mod passkey;
 mod password;
 pub mod repositories;
 mod session;
+pub mod transaction;
 
 pub use repositories::PostgresBruteForceRepository;
-pub use repositories::PostgresRepositoryProvider;
+pub use repositories::{
+    PostgresPasswordRepository, PostgresRepositoryProvider, PostgresUserRepository,
+};
+pub use transaction::{
+    PostgresTransactionBruteForce, PostgresTransactionOAuth, PostgresTransactionPasskeys,
+    PostgresTransactionPasswords, PostgresTransactionSessions, PostgresTransactionTokens,
+    PostgresTransactionUsers, PostgresTransactionView,
+};
 
 use chrono::DateTime;
 use chrono::Utc;
@@ -73,11 +81,68 @@ use migrations::CreateSecureTokensTable;
 use migrations::CreateSessionsTable;
 use migrations::CreateUsersTable;
 use migrations::PostgresMigrationManager;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use torii_core::error::StorageError;
-use torii_core::{User, UserId};
+use torii_core::{
+    TransactionAdapter, TransactionError, TransactionOperation, TransactionRunner,
+    TransactionRunnerProvider, User, UserId,
+};
 use torii_migration::Migration;
 use torii_migration::MigrationManager;
+
+pub struct PostgresTransactionAdapter<'a> {
+    pub transaction: Transaction<'a, Postgres>,
+}
+impl TransactionAdapter for PostgresTransactionAdapter<'static> {
+    fn backend(&self) -> &'static str {
+        "postgres"
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+pub struct PostgresTransactionRunner {
+    pool: PgPool,
+}
+impl PostgresTransactionRunner {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+impl TransactionRunnerProvider for PostgresRepositoryProvider {
+    type TransactionRunner = PostgresTransactionRunner;
+    fn transaction_runner(&self) -> Self::TransactionRunner {
+        PostgresTransactionRunner::new(self.database_pool())
+    }
+}
+
+#[async_trait::async_trait]
+impl TransactionRunner for PostgresTransactionRunner {
+    async fn run<T: Send + 'static>(
+        &self,
+        operation: Box<dyn TransactionOperation<T>>,
+    ) -> Result<T, TransactionError> {
+        let transaction = sqlx::Acquire::begin(&self.pool)
+            .await
+            .map_err(|e| TransactionError::Failed(e.to_string()))?;
+        let mut adapter = PostgresTransactionAdapter { transaction };
+        match operation.execute(&mut adapter).await {
+            Ok(value) => {
+                adapter
+                    .transaction
+                    .commit()
+                    .await
+                    .map_err(|e| TransactionError::Failed(e.to_string()))?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = adapter.transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PostgresStorage {
@@ -190,7 +255,7 @@ pub(crate) mod tests {
 
         let _ = tracing_subscriber::fmt().try_init();
 
-        let pool = PgPool::connect("postgres://postgres:postgres@localhost:5432/postgres")
+        let pool = PgPool::connect("postgres://postgres@localhost:5432/postgres")
             .await
             .expect("Failed to create pool");
 
@@ -208,11 +273,10 @@ pub(crate) mod tests {
             .await
             .expect("Failed to create database");
 
-        let pool = PgPool::connect(
-            format!("postgres://postgres:postgres@localhost:5432/{db_name}").as_str(),
-        )
-        .await
-        .expect("Failed to create pool");
+        let pool =
+            PgPool::connect(format!("postgres://postgres@localhost:5432/{db_name}").as_str())
+                .await
+                .expect("Failed to create pool");
 
         let storage = PostgresStorage::new(pool);
         storage.migrate().await.expect("Failed to run migrations");
@@ -224,15 +288,24 @@ pub(crate) mod tests {
         id: &UserId,
     ) -> Result<User, torii_core::Error> {
         let user_repo = PostgresUserRepository::new(storage.pool.clone());
-        user_repo
+        let transaction = storage.pool.begin().await.map_err(|error| {
+            torii_core::Error::Storage(StorageError::Database(error.to_string()))
+        })?;
+        let mut adapter = PostgresTransactionAdapter { transaction };
+        let user = user_repo
             .create(
+                &mut adapter,
                 NewUser::builder()
                     .id(id.clone())
                     .email(format!("test{id}@example.com"))
                     .build()
                     .expect("Failed to build user"),
             )
-            .await
+            .await?;
+        adapter.transaction.commit().await.map_err(|error| {
+            torii_core::Error::Storage(StorageError::Database(error.to_string()))
+        })?;
+        Ok(user)
     }
 
     pub(crate) async fn create_test_session(
@@ -242,9 +315,14 @@ pub(crate) mod tests {
         expires_in: Duration,
     ) -> Result<Session, torii_core::Error> {
         let session_repo = PostgresSessionRepository::new(storage.pool.clone());
+        let transaction = storage.pool.begin().await.map_err(|error| {
+            torii_core::Error::Storage(StorageError::Database(error.to_string()))
+        })?;
+        let mut adapter = PostgresTransactionAdapter { transaction };
         let now = Utc::now();
-        session_repo
+        let session = session_repo
             .create(
+                &mut adapter,
                 Session::builder()
                     .token(session_token.clone())
                     .user_id(user_id.clone())
@@ -256,6 +334,48 @@ pub(crate) mod tests {
                     .build()
                     .expect("Failed to build session"),
             )
-            .await
+            .await?;
+        adapter.transaction.commit().await.map_err(|error| {
+            torii_core::Error::Storage(StorageError::Database(error.to_string()))
+        })?;
+        Ok(session)
+    }
+
+    pub(crate) async fn run_in_transaction<T, F>(
+        storage: &PostgresStorage,
+        operation: F,
+    ) -> Result<T, torii_core::Error>
+    where
+        F: for<'a> FnOnce(
+            &'a mut PostgresTransactionAdapter<'static>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<T, torii_core::Error>> + 'a>,
+        >,
+    {
+        let transaction = storage.pool.begin().await.map_err(|error| {
+            torii_core::Error::Storage(StorageError::Database(error.to_string()))
+        })?;
+        let mut adapter = PostgresTransactionAdapter { transaction };
+        let result = operation(&mut adapter).await?;
+        adapter.transaction.commit().await.map_err(|error| {
+            torii_core::Error::Storage(StorageError::Database(error.to_string()))
+        })?;
+        Ok(result)
+    }
+
+    pub(crate) async fn create_test_session_value(
+        storage: &PostgresStorage,
+        session: Session,
+    ) -> Result<Session, torii_core::Error> {
+        let session_repo = PostgresSessionRepository::new(storage.pool.clone());
+        let transaction = storage.pool.begin().await.map_err(|error| {
+            torii_core::Error::Storage(StorageError::Database(error.to_string()))
+        })?;
+        let mut adapter = PostgresTransactionAdapter { transaction };
+        let session = session_repo.create(&mut adapter, session).await?;
+        adapter.transaction.commit().await.map_err(|error| {
+            torii_core::Error::Storage(StorageError::Database(error.to_string()))
+        })?;
+        Ok(session)
     }
 }

@@ -18,7 +18,11 @@ mod tests {
             .email("test@test.com".to_string())
             .build()
             .unwrap();
-        user_repo.create(user).await.unwrap()
+        crate::tests::run_in_transaction(storage, move |adapter| {
+            Box::pin(async move { user_repo.create(adapter, user).await })
+        })
+        .await
+        .unwrap()
     }
 
     async fn add_passkey(

@@ -22,50 +22,13 @@ impl From<user::Model> for ToriiUser {
 mod tests {
     use crate::SeaORMStorage;
     use crate::repositories::SeaORMUserRepository;
-    use sea_orm::{Database, DatabaseConnection};
-
-    use tokio::sync::OnceCell;
+    use sea_orm_migration::MigratorTrait;
     use torii_core::repositories::UserRepository;
     use torii_core::{UserId, storage::NewUser};
 
-    static TEST_DB: OnceCell<DatabaseConnection> = OnceCell::const_new();
-
-    async fn get_test_db() -> &'static DatabaseConnection {
-        TEST_DB
-            .get_or_init(|| async {
-                let database_url =
-                    std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite::memory:".to_string());
-
-                Database::connect(&database_url)
-                    .await
-                    .expect("Failed to connect to test database")
-            })
-            .await
-    }
-
     async fn setup_test_storage() -> SeaORMStorage {
-        let db = get_test_db().await.clone();
-
-        // Create test user table using raw SQL for simplicity
-        let create_table = r#"
-            CREATE TABLE IF NOT EXISTS users (
-                id TEXT PRIMARY KEY DEFAULT (hex(randomblob(16))),
-                email TEXT NOT NULL UNIQUE,
-                name TEXT,
-                email_verified_at DATETIME,
-                locked_at DATETIME,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        "#;
-
-        use sea_orm::{ConnectionTrait, Statement};
-        let _ = db
-            .execute(Statement::from_string(
-                sea_orm::DatabaseBackend::Sqlite,
-                create_table.to_string(),
-            ))
-            .await;
+        let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        crate::migrations::Migrator::up(&db, None).await.unwrap();
 
         SeaORMStorage::new(db)
     }
@@ -81,7 +44,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let result = user_repo.create(new_user).await;
+        let result = user_repo
+            .create(&mut torii_core::NoopTransactionAdapter, new_user)
+            .await;
         assert!(result.is_ok());
 
         let user = result.unwrap();
@@ -99,7 +64,10 @@ mod tests {
             .build()
             .unwrap();
 
-        let created_user = user_repo.create(new_user).await.unwrap();
+        let created_user = user_repo
+            .create(&mut torii_core::NoopTransactionAdapter, new_user)
+            .await
+            .unwrap();
 
         let result = user_repo.find_by_id(&created_user.id).await;
         assert!(result.is_ok());
@@ -131,7 +99,10 @@ mod tests {
             .build()
             .unwrap();
 
-        let _ = user_repo.create(new_user).await.unwrap();
+        let _ = user_repo
+            .create(&mut torii_core::NoopTransactionAdapter, new_user)
+            .await
+            .unwrap();
 
         let result = user_repo.find_by_email("test@example.com").await;
         assert!(result.is_ok());
@@ -162,7 +133,10 @@ mod tests {
             .build()
             .unwrap();
 
-        let created_user = user_repo.create(new_user).await.unwrap();
+        let created_user = user_repo
+            .create(&mut torii_core::NoopTransactionAdapter, new_user)
+            .await
+            .unwrap();
 
         let result = user_repo.find_or_create_by_email("test@example.com").await;
         assert!(result.is_ok());
@@ -195,9 +169,14 @@ mod tests {
             .build()
             .unwrap();
 
-        let created_user = user_repo.create(new_user).await.unwrap();
+        let created_user = user_repo
+            .create(&mut torii_core::NoopTransactionAdapter, new_user)
+            .await
+            .unwrap();
 
-        let result = user_repo.delete(&created_user.id).await;
+        let result = user_repo
+            .delete(&mut torii_core::NoopTransactionAdapter, &created_user.id)
+            .await;
         assert!(result.is_ok());
 
         // Verify user is deleted
@@ -216,9 +195,14 @@ mod tests {
             .build()
             .unwrap();
 
-        let created_user = user_repo.create(new_user).await.unwrap();
+        let created_user = user_repo
+            .create(&mut torii_core::NoopTransactionAdapter, new_user)
+            .await
+            .unwrap();
 
-        let result = user_repo.mark_email_verified(&created_user.id).await;
+        let result = user_repo
+            .mark_email_verified(&mut torii_core::NoopTransactionAdapter, &created_user.id)
+            .await;
         assert!(result.is_ok());
 
         // Verify email is marked as verified

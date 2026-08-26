@@ -1,10 +1,13 @@
-use crate::{EventBus, EventEmitter, services::UserService};
+use crate::{
+    HookRegistry, PasswordRegistrationOutcome, RegisterUserOperation, services::UserService,
+};
 use std::sync::Arc;
 use torii_core::{
     Error, User, UserId,
     error::AuthError,
-    events::Event,
-    repositories::{PasswordRepository, UserRepository},
+    repositories::{PasswordRepository, TransactionalRepositoryProvider, UserRepository},
+    storage::NewUser,
+    transaction::TransactionRunner,
     validation::validate_password,
 };
 
@@ -12,24 +15,60 @@ use torii_core::{
 pub struct PasswordService<U: UserRepository, P: PasswordRepository> {
     user_service: Arc<UserService<U>>,
     password_repository: Arc<P>,
-    event_bus: Option<Arc<EventBus>>,
 }
 
 impl<U: UserRepository, P: PasswordRepository> PasswordService<U, P> {
+    /// Register a user and password in the provider-owned transaction.
+    pub async fn register_user_transactional<T, R>(
+        &self,
+        runner: &T,
+        repositories: Arc<R>,
+        hooks: Arc<HookRegistry>,
+        email: &str,
+        password: &str,
+        name: Option<String>,
+    ) -> Result<PasswordRegistrationOutcome, Error>
+    where
+        T: TransactionRunner,
+        R: TransactionalRepositoryProvider,
+    {
+        validate_password(password)?;
+        if let Some(user) = self.user_service.get_user_by_email(email).await? {
+            return Ok(PasswordRegistrationOutcome {
+                user,
+                password_created: false,
+            });
+        }
+        let password_hash = Self::hash_password(password)?;
+        let mut builder = NewUser::builder()
+            .id(UserId::new_random())
+            .email(email.to_string());
+        if let Some(name) = name {
+            builder = builder.name(name);
+        }
+        let new_user = builder.build()?;
+        let user = runner
+            .run(Box::new(RegisterUserOperation {
+                repositories,
+                hooks,
+                new_user,
+                password_hash,
+            }))
+            .await
+            .map_err(|error| Error::Auth(AuthError::UnsupportedMethod(error.to_string())))?;
+
+        Ok(PasswordRegistrationOutcome {
+            user,
+            password_created: true,
+        })
+    }
     /// Create a new PasswordService with the given repositories
     pub fn new(user_repository: Arc<U>, password_repository: Arc<P>) -> Self {
         let user_service = Arc::new(UserService::new(user_repository));
         Self {
             user_service,
             password_repository,
-            event_bus: None,
         }
-    }
-
-    /// Enable password event emission for this service.
-    pub fn with_event_bus(mut self, event_bus: Arc<EventBus>) -> Self {
-        self.event_bus = Some(event_bus);
-        self
     }
 
     /// Register a new user with a password
@@ -42,6 +81,7 @@ impl<U: UserRepository, P: PasswordRepository> PasswordService<U, P> {
     /// could register with a victim's email and set their own password.
     pub async fn register_user(
         &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
         email: &str,
         password: &str,
         name: Option<String>,
@@ -60,18 +100,16 @@ impl<U: UserRepository, P: PasswordRepository> PasswordService<U, P> {
         let password_hash = Self::hash_password(password)?;
 
         // Create the user (email validation happens in UserService)
-        let user = self.user_service.create_user(email, name).await?;
+        let user = self
+            .user_service
+            .create_user(transaction, email, name)
+            .await?;
 
         // Store the password hash
         self.password_repository
             .set_password_hash(&user.id, &password_hash)
             .await?;
 
-        self.emit_event(Event::PasswordRegistered(user.id.clone()))
-            .await?;
-
-        self.emit_event(Event::PasswordAuthenticated(user.id.clone()))
-            .await?;
         Ok(user)
     }
 
@@ -129,9 +167,6 @@ impl<U: UserRepository, P: PasswordRepository> PasswordService<U, P> {
             .set_password_hash(user_id, &new_hash)
             .await?;
 
-        self.emit_event(Event::PasswordChanged(user_id.clone()))
-            .await?;
-
         Ok(())
     }
 
@@ -144,8 +179,6 @@ impl<U: UserRepository, P: PasswordRepository> PasswordService<U, P> {
         self.password_repository
             .set_password_hash(user_id, &password_hash)
             .await?;
-        self.emit_event(Event::PasswordChanged(user_id.clone()))
-            .await?;
         Ok(())
     }
 
@@ -153,8 +186,6 @@ impl<U: UserRepository, P: PasswordRepository> PasswordService<U, P> {
     pub async fn remove_password(&self, user_id: &UserId) -> Result<(), Error> {
         self.password_repository
             .remove_password_hash(user_id)
-            .await?;
-        self.emit_event(Event::PasswordRemoved(user_id.clone()))
             .await?;
         Ok(())
     }
@@ -179,13 +210,6 @@ impl<U: UserRepository, P: PasswordRepository> PasswordService<U, P> {
     fn verify_password(password: &str, hash: &str) -> Result<bool, Error> {
         use password_auth::verify_password;
         Ok(verify_password(password, hash).is_ok())
-    }
-}
-
-#[async_trait::async_trait]
-impl<U: UserRepository, P: PasswordRepository> EventEmitter for PasswordService<U, P> {
-    fn event_bus(&self) -> Option<&Arc<EventBus>> {
-        self.event_bus.as_ref()
     }
 }
 
@@ -233,7 +257,11 @@ mod tests {
 
     #[async_trait]
     impl UserRepository for MockUserRepository {
-        async fn create(&self, new_user: NewUser) -> Result<User, Error> {
+        async fn create(
+            &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
+            new_user: NewUser,
+        ) -> Result<User, Error> {
             let user = MockUser {
                 id: UserId::new_random(),
                 email: new_user.email.clone(),
@@ -272,19 +300,32 @@ mod tests {
                 Ok(user)
             } else {
                 let new_user = NewUser::builder().email(email.to_string()).build().unwrap();
-                self.create(new_user).await
+                self.create(&mut torii_core::NoopTransactionAdapter, new_user)
+                    .await
             }
         }
 
-        async fn update(&self, _user: &User) -> Result<User, Error> {
+        async fn update(
+            &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
+            _user: &User,
+        ) -> Result<User, Error> {
             unimplemented!()
         }
 
-        async fn delete(&self, _id: &UserId) -> Result<(), Error> {
+        async fn delete(
+            &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
+            _id: &UserId,
+        ) -> Result<(), Error> {
             unimplemented!()
         }
 
-        async fn mark_email_verified(&self, _user_id: &UserId) -> Result<(), Error> {
+        async fn mark_email_verified(
+            &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
+            _user_id: &UserId,
+        ) -> Result<(), Error> {
             Ok(())
         }
     }
@@ -323,7 +364,12 @@ mod tests {
 
         // Try to register with a weak password (too short)
         let result = service
-            .register_user("test@example.com", "weak", None)
+            .register_user(
+                &mut torii_core::NoopTransactionAdapter,
+                "test@example.com",
+                "weak",
+                None,
+            )
             .await;
 
         assert!(result.is_err());
@@ -348,7 +394,14 @@ mod tests {
         let service = PasswordService::new(user_repo.clone(), password_repo.clone());
 
         // Try to register with an empty password
-        let result = service.register_user("test@example.com", "", None).await;
+        let result = service
+            .register_user(
+                &mut torii_core::NoopTransactionAdapter,
+                "test@example.com",
+                "",
+                None,
+            )
+            .await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -366,7 +419,12 @@ mod tests {
 
         // Register with a valid password (8+ characters)
         let result = service
-            .register_user("test@example.com", "validpass123", None)
+            .register_user(
+                &mut torii_core::NoopTransactionAdapter,
+                "test@example.com",
+                "validpass123",
+                None,
+            )
             .await;
 
         assert!(result.is_ok());
@@ -386,6 +444,7 @@ mod tests {
         // Create a user directly
         let user = user_repo
             .create(
+                &mut torii_core::NoopTransactionAdapter,
                 NewUser::builder()
                     .email("test@example.com".to_string())
                     .build()
@@ -418,6 +477,7 @@ mod tests {
         // Create a user directly
         let user = user_repo
             .create(
+                &mut torii_core::NoopTransactionAdapter,
                 NewUser::builder()
                     .email("test@example.com".to_string())
                     .build()
@@ -446,6 +506,7 @@ mod tests {
         // Create a user and set their initial password
         let user = user_repo
             .create(
+                &mut torii_core::NoopTransactionAdapter,
                 NewUser::builder()
                     .email("test@example.com".to_string())
                     .build()
@@ -488,6 +549,7 @@ mod tests {
         // Create a user and set their initial password
         let user = user_repo
             .create(
+                &mut torii_core::NoopTransactionAdapter,
                 NewUser::builder()
                     .email("test@example.com".to_string())
                     .build()

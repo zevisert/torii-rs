@@ -15,17 +15,24 @@ pub mod id;
 pub mod repositories;
 pub mod session;
 pub mod storage;
+pub mod transaction;
 pub mod user;
 pub mod validation;
 
 pub use error::Error;
 pub use events::{Event, EventEnvelope, EventHandler, EventId, ReplicaId, UnlockReason};
-pub use repositories::RepositoryProvider;
+pub use repositories::{
+    RepositoryProvider, TransactionRunnerProvider, TransactionalRepositoryProvider,
+};
 #[cfg(feature = "jwt")]
 pub use session::{JwtAlgorithm, JwtClaims, JwtConfig, JwtMetadata, JwtSessionProvider};
 pub use session::{OpaqueSessionProvider, Session, SessionProvider, SessionToken};
 pub use storage::{
     AttemptStats, BruteForceProtectionConfig, FailedLoginAttempt, LockoutStatus, NewUser,
     SecureToken, TokenPurpose,
+};
+pub use transaction::{
+    NoopTransactionAdapter, TransactionAdapter, TransactionError, TransactionOperation,
+    TransactionRunner,
 };
 pub use user::{OAuthAccount, User, UserId, UserManager};

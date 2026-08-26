@@ -808,7 +808,7 @@ mod tests {
 
         let _ = tracing_subscriber::fmt().try_init();
 
-        let pool = PgPool::connect("postgres://postgres:postgres@localhost:5432/postgres")
+        let pool = PgPool::connect("postgres://postgres@localhost:5432/postgres")
             .await
             .expect("Failed to create pool");
 
@@ -826,11 +826,10 @@ mod tests {
             .await
             .expect("Failed to create database");
 
-        let pool = PgPool::connect(
-            format!("postgres://postgres:postgres@localhost:5432/{db_name}").as_str(),
-        )
-        .await
-        .expect("Failed to create pool");
+        let pool =
+            PgPool::connect(format!("postgres://postgres@localhost:5432/{db_name}").as_str())
+                .await
+                .expect("Failed to create pool");
 
         // Initialize migrations table
         let manager = PostgresMigrationManager::new(pool);

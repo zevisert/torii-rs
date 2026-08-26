@@ -13,8 +13,15 @@ mod tests {
         use torii_core::repositories::UserRepository;
 
         let user_repo = PostgresUserRepository::new(storage.pool.clone());
+        let transaction = storage
+            .pool
+            .begin()
+            .await
+            .expect("Failed to begin transaction");
+        let mut adapter = crate::PostgresTransactionAdapter { transaction };
         user_repo
             .create(
+                &mut adapter,
                 NewUser::builder()
                     .id(user_id.clone())
                     .email(format!("test{}@example.com", user_id.as_str()))
@@ -23,6 +30,11 @@ mod tests {
             )
             .await
             .expect("Failed to create user");
+        adapter
+            .transaction
+            .commit()
+            .await
+            .expect("Failed to commit transaction");
     }
 
     #[tokio::test]

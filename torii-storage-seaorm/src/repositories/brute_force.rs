@@ -13,6 +13,7 @@ use torii_core::{
     storage::{AttemptStats, FailedLoginAttempt},
 };
 
+use crate::SeaORMTransactionAdapter;
 use crate::entities::{failed_login_attempt, user};
 
 /// SeaORM repository for brute force protection data.
@@ -31,10 +32,17 @@ impl SeaORMBruteForceRepository {
 impl BruteForceProtectionRepository for SeaORMBruteForceRepository {
     async fn record_failed_attempt(
         &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
         email: &str,
         ip_address: Option<&str>,
     ) -> Result<FailedLoginAttempt, Error> {
         let now = Utc::now();
+        let adapter = transaction
+            .as_any_mut()
+            .downcast_mut::<SeaORMTransactionAdapter>()
+            .ok_or_else(|| {
+                StorageError::Database("SeaORM transaction adapter required".to_string())
+            })?;
 
         let model = failed_login_attempt::ActiveModel {
             email: Set(email.to_string()),
@@ -43,7 +51,7 @@ impl BruteForceProtectionRepository for SeaORMBruteForceRepository {
             ..Default::default()
         };
 
-        let result = model.insert(&self.db).await.map_err(|e| {
+        let result = model.insert(adapter.transaction()).await.map_err(|e| {
             StorageError::Database(format!("Failed to record failed login attempt: {e}"))
         })?;
 
@@ -86,10 +94,20 @@ impl BruteForceProtectionRepository for SeaORMBruteForceRepository {
         }
     }
 
-    async fn clear_attempts(&self, email: &str) -> Result<u64, Error> {
+    async fn clear_attempts(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        email: &str,
+    ) -> Result<u64, Error> {
+        let adapter = transaction
+            .as_any_mut()
+            .downcast_mut::<SeaORMTransactionAdapter>()
+            .ok_or_else(|| {
+                StorageError::Database("SeaORM transaction adapter required".to_string())
+            })?;
         let result = failed_login_attempt::Entity::delete_many()
             .filter(failed_login_attempt::Column::Email.eq(email))
-            .exec(&self.db)
+            .exec(adapter.transaction())
             .await
             .map_err(|e| StorageError::Database(format!("Failed to clear attempts: {e}")))?;
 
@@ -126,13 +144,20 @@ impl BruteForceProtectionRepository for SeaORMBruteForceRepository {
 
     async fn set_locked_at(
         &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
         email: &str,
         locked_at: Option<DateTime<Utc>>,
     ) -> Result<(), Error> {
+        let adapter = transaction
+            .as_any_mut()
+            .downcast_mut::<SeaORMTransactionAdapter>()
+            .ok_or_else(|| {
+                StorageError::Database("SeaORM transaction adapter required".to_string())
+            })?;
         // Find the user first
         let user_model = user::Entity::find()
             .filter(user::Column::Email.eq(email))
-            .one(&self.db)
+            .one(adapter.transaction())
             .await
             .map_err(|e| StorageError::Database(format!("Failed to find user: {e}")))?;
 
@@ -142,7 +167,7 @@ impl BruteForceProtectionRepository for SeaORMBruteForceRepository {
             active_model.locked_at = Set(locked_at);
             active_model.updated_at = Set(Utc::now());
             active_model
-                .update(&self.db)
+                .update(adapter.transaction())
                 .await
                 .map_err(|e| StorageError::Database(format!("Failed to set locked_at: {e}")))?;
         }

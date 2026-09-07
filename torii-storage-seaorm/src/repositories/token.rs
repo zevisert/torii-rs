@@ -13,8 +13,8 @@ use torii_core::{
     storage::{SecureToken, TokenPurpose},
 };
 
-use crate::SeaORMStorageError;
 use crate::entities::secure_token;
+use crate::{SeaORMStorageError, SeaORMTransactionAdapter};
 
 /// SeaORM implementation of TokenRepository
 pub struct SeaORMTokenRepository {
@@ -34,12 +34,83 @@ impl SeaORMTokenRepository {
             .expect("Failed to generate random bytes - system RNG unavailable");
         BASE64_URL_SAFE_NO_PAD.encode(bytes)
     }
+
+    async fn insert_model(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        model: secure_token::ActiveModel,
+    ) -> Result<secure_token::Model, SeaORMStorageError> {
+        if let Some(adapter) = transaction
+            .as_any_mut()
+            .downcast_mut::<SeaORMTransactionAdapter>()
+        {
+            model
+                .insert(adapter.transaction())
+                .await
+                .map_err(SeaORMStorageError::Database)
+        } else {
+            model
+                .insert(&self.pool)
+                .await
+                .map_err(SeaORMStorageError::Database)
+        }
+    }
+
+    async fn find_token(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        token_hash: &str,
+        purpose: TokenPurpose,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Option<secure_token::Model>, SeaORMStorageError> {
+        let query = secure_token::Entity::find()
+            .filter(secure_token::Column::Token.eq(token_hash))
+            .filter(secure_token::Column::Purpose.eq(purpose.as_str()))
+            .filter(secure_token::Column::ExpiresAt.gt(now))
+            .filter(secure_token::Column::UsedAt.is_null());
+        if let Some(adapter) = transaction
+            .as_any_mut()
+            .downcast_mut::<SeaORMTransactionAdapter>()
+        {
+            query
+                .one(adapter.transaction())
+                .await
+                .map_err(SeaORMStorageError::Database)
+        } else {
+            query
+                .one(&self.pool)
+                .await
+                .map_err(SeaORMStorageError::Database)
+        }
+    }
+
+    async fn update_token_used(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        model: secure_token::ActiveModel,
+    ) -> Result<secure_token::Model, SeaORMStorageError> {
+        if let Some(adapter) = transaction
+            .as_any_mut()
+            .downcast_mut::<SeaORMTransactionAdapter>()
+        {
+            model
+                .update(adapter.transaction())
+                .await
+                .map_err(SeaORMStorageError::Database)
+        } else {
+            model
+                .update(&self.pool)
+                .await
+                .map_err(SeaORMStorageError::Database)
+        }
+    }
 }
 
 #[async_trait]
 impl TokenRepository for SeaORMTokenRepository {
     async fn create_token(
         &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
         user_id: &UserId,
         purpose: TokenPurpose,
         expires_in: Duration,
@@ -61,10 +132,7 @@ impl TokenRepository for SeaORMTokenRepository {
             ..Default::default()
         };
 
-        let result = model
-            .insert(&self.pool)
-            .await
-            .map_err(SeaORMStorageError::Database)?;
+        let result = self.insert_model(transaction, model).await?;
 
         // Return SecureToken with plaintext token (for the caller) and hash (stored)
         Ok(SecureToken::new(
@@ -81,6 +149,7 @@ impl TokenRepository for SeaORMTokenRepository {
 
     async fn verify_token(
         &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
         token: &str,
         purpose: TokenPurpose,
     ) -> Result<Option<SecureToken>, Error> {
@@ -89,14 +158,9 @@ impl TokenRepository for SeaORMTokenRepository {
         let now = Utc::now();
 
         // Query the specific token by its hash
-        let result = secure_token::Entity::find()
-            .filter(secure_token::Column::Token.eq(&token_hash))
-            .filter(secure_token::Column::Purpose.eq(purpose.as_str()))
-            .filter(secure_token::Column::ExpiresAt.gt(now))
-            .filter(secure_token::Column::UsedAt.is_null())
-            .one(&self.pool)
-            .await
-            .map_err(SeaORMStorageError::Database)?;
+        let result = self
+            .find_token(transaction, &token_hash, purpose, now)
+            .await?;
 
         if let Some(row) = result {
             let user_id = UserId::new(&row.user_id);
@@ -125,10 +189,7 @@ impl TokenRepository for SeaORMTokenRepository {
                 active_model.used_at = Set(Some(now));
                 active_model.updated_at = Set(now);
 
-                active_model
-                    .update(&self.pool)
-                    .await
-                    .map_err(SeaORMStorageError::Database)?;
+                self.update_token_used(transaction, active_model).await?;
 
                 // Update the token's used_at field for the return value
                 let mut updated_token = secure_token;
@@ -202,10 +263,13 @@ impl TokenRepository for SeaORMTokenRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::migrations::Migrator;
-    use crate::repositories::SeaORMUserRepository;
-    use sea_orm::Database;
+    use crate::{migrations::Migrator, repositories::SeaORMTransaction};
+    use sea_orm::{Database, TransactionTrait};
     use sea_orm_migration::MigratorTrait;
+    use torii_core::{
+        repositories::{TransactionRepositoryView, TransactionUserRepository},
+        storage::NewUser,
+    };
 
     async fn setup_test_db() -> DatabaseConnection {
         let pool = Database::connect("sqlite::memory:").await.unwrap();
@@ -213,12 +277,24 @@ mod tests {
         pool
     }
 
+    async fn begin_transaction(pool: &DatabaseConnection) -> crate::SeaORMTransactionAdapter {
+        crate::SeaORMTransactionAdapter::new(pool.begin().await.unwrap())
+    }
+
     async fn create_test_user(pool: &DatabaseConnection) -> UserId {
-        let repo = SeaORMUserRepository::new(pool.clone());
-        let user = repo
-            .create_user("test@example.com", Some("Test User"))
+        let mut transaction = begin_transaction(pool).await;
+        let mut view = SeaORMTransaction::new(&mut transaction).unwrap();
+        let user = view
+            .users()
+            .create(NewUser {
+                id: UserId::new_random(),
+                email: "test@example.com".to_string(),
+                name: Some("Test User".to_string()),
+                email_verified_at: None,
+            })
             .await
             .unwrap();
+        transaction.into_inner().commit().await.unwrap();
         user.id
     }
 
@@ -229,7 +305,12 @@ mod tests {
         let user_id = create_test_user(&pool).await;
 
         let token = repo
-            .create_token(&user_id, TokenPurpose::PasswordReset, Duration::hours(1))
+            .create_token(
+                &mut torii_core::NoopTransactionAdapter,
+                &user_id,
+                TokenPurpose::PasswordReset,
+                Duration::hours(1),
+            )
             .await
             .unwrap();
 
@@ -238,7 +319,11 @@ mod tests {
 
         // Verify the token using the plaintext
         let verified = repo
-            .verify_token(token.token().unwrap(), TokenPurpose::PasswordReset)
+            .verify_token(
+                &mut torii_core::NoopTransactionAdapter,
+                token.token().unwrap(),
+                TokenPurpose::PasswordReset,
+            )
             .await
             .unwrap();
 
@@ -255,6 +340,7 @@ mod tests {
 
         let token = repo
             .create_token(
+                &mut torii_core::NoopTransactionAdapter,
                 &user_id,
                 TokenPurpose::EmailVerification,
                 Duration::hours(1),
@@ -286,20 +372,33 @@ mod tests {
         let user_id = create_test_user(&pool).await;
 
         let token = repo
-            .create_token(&user_id, TokenPurpose::PasswordReset, Duration::hours(1))
+            .create_token(
+                &mut torii_core::NoopTransactionAdapter,
+                &user_id,
+                TokenPurpose::PasswordReset,
+                Duration::hours(1),
+            )
             .await
             .unwrap();
 
         // First verification should succeed
         let verified = repo
-            .verify_token(token.token().unwrap(), TokenPurpose::PasswordReset)
+            .verify_token(
+                &mut torii_core::NoopTransactionAdapter,
+                token.token().unwrap(),
+                TokenPurpose::PasswordReset,
+            )
             .await
             .unwrap();
         assert!(verified.is_some());
 
         // Second verification should fail (token already used)
         let verified = repo
-            .verify_token(token.token().unwrap(), TokenPurpose::PasswordReset)
+            .verify_token(
+                &mut torii_core::NoopTransactionAdapter,
+                token.token().unwrap(),
+                TokenPurpose::PasswordReset,
+            )
             .await
             .unwrap();
         assert!(verified.is_none());

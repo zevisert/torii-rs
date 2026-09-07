@@ -7,6 +7,7 @@ use sea_orm::{
 use torii_core::{Error, Session, UserId, repositories::SessionRepository, session::SessionToken};
 
 use crate::SeaORMStorageError;
+use crate::SeaORMTransactionAdapter;
 use crate::entities::session;
 
 pub struct SeaORMSessionRepository {
@@ -21,7 +22,19 @@ impl SeaORMSessionRepository {
 
 #[async_trait]
 impl SessionRepository for SeaORMSessionRepository {
-    async fn create(&self, session: Session) -> Result<Session, Error> {
+    async fn create(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        session: Session,
+    ) -> Result<Session, Error> {
+        let adapter = transaction
+            .as_any_mut()
+            .downcast_mut::<SeaORMTransactionAdapter>()
+            .ok_or_else(|| {
+                SeaORMStorageError::Database(sea_orm::DbErr::Custom(
+                    "SeaORM transaction adapter required".into(),
+                ))
+            })?;
         // Store the hash, not the plaintext token
         let s = session::ActiveModel {
             user_id: Set(session.user_id.to_string()),
@@ -33,7 +46,7 @@ impl SessionRepository for SeaORMSessionRepository {
         };
 
         let result = s
-            .insert(&self.pool)
+            .insert(adapter.transaction())
             .await
             .map_err(SeaORMStorageError::Database)?;
 
@@ -80,23 +93,47 @@ impl SessionRepository for SeaORMSessionRepository {
         Ok(None)
     }
 
-    async fn delete(&self, token: &SessionToken) -> Result<(), Error> {
+    async fn delete(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        token: &SessionToken,
+    ) -> Result<(), Error> {
+        let adapter = transaction
+            .as_any_mut()
+            .downcast_mut::<SeaORMTransactionAdapter>()
+            .ok_or_else(|| {
+                SeaORMStorageError::Database(sea_orm::DbErr::Custom(
+                    "SeaORM transaction adapter required".into(),
+                ))
+            })?;
         // Compute the hash of the provided token for deletion
         let token_hash = token.token_hash();
 
         session::Entity::delete_many()
             .filter(session::Column::Token.eq(&token_hash))
-            .exec(&self.pool)
+            .exec(adapter.transaction())
             .await
             .map_err(SeaORMStorageError::Database)?;
 
         Ok(())
     }
 
-    async fn delete_by_user_id(&self, user_id: &UserId) -> Result<(), Error> {
+    async fn delete_by_user_id(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        user_id: &UserId,
+    ) -> Result<(), Error> {
+        let adapter = transaction
+            .as_any_mut()
+            .downcast_mut::<SeaORMTransactionAdapter>()
+            .ok_or_else(|| {
+                SeaORMStorageError::Database(sea_orm::DbErr::Custom(
+                    "SeaORM transaction adapter required".into(),
+                ))
+            })?;
         session::Entity::delete_many()
             .filter(session::Column::UserId.eq(user_id.as_str()))
-            .exec(&self.pool)
+            .exec(adapter.transaction())
             .await
             .map_err(SeaORMStorageError::Database)?;
 
@@ -138,7 +175,20 @@ impl SessionRepository for SeaORMSessionRepository {
             .collect())
     }
 
-    async fn refresh(&self, token: &SessionToken, duration: Duration) -> Result<Session, Error> {
+    async fn refresh(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        token: &SessionToken,
+        duration: Duration,
+    ) -> Result<Session, Error> {
+        let adapter = transaction
+            .as_any_mut()
+            .downcast_mut::<SeaORMTransactionAdapter>()
+            .ok_or_else(|| {
+                SeaORMStorageError::Database(sea_orm::DbErr::Custom(
+                    "SeaORM transaction adapter required".into(),
+                ))
+            })?;
         let token_hash = token.token_hash();
         let now = Utc::now();
         let new_expires_at = now + duration;
@@ -146,7 +196,7 @@ impl SessionRepository for SeaORMSessionRepository {
         // Find the session first
         let existing = session::Entity::find()
             .filter(session::Column::Token.eq(&token_hash))
-            .one(&self.pool)
+            .one(adapter.transaction())
             .await
             .map_err(SeaORMStorageError::Database)?
             .ok_or_else(|| {
@@ -161,7 +211,7 @@ impl SessionRepository for SeaORMSessionRepository {
         active.updated_at = Set(now);
 
         let updated = active
-            .update(&self.pool)
+            .update(adapter.transaction())
             .await
             .map_err(SeaORMStorageError::Database)?;
 
@@ -182,10 +232,12 @@ impl SessionRepository for SeaORMSessionRepository {
 mod tests {
     use super::*;
     use crate::migrations::Migrator;
-    use crate::repositories::SeaORMUserRepository;
+    use crate::{SeaORMTransactionAdapter, repositories::SeaORMTransaction};
     use chrono::Duration;
-    use sea_orm::Database;
+    use sea_orm::{Database, TransactionTrait};
     use sea_orm_migration::MigratorTrait;
+    use torii_core::repositories::{TransactionRepositoryView, TransactionUserRepository};
+    use torii_core::storage::NewUser;
 
     async fn setup_test_db() -> DatabaseConnection {
         let pool = Database::connect("sqlite::memory:").await.unwrap();
@@ -193,12 +245,24 @@ mod tests {
         pool
     }
 
+    async fn begin_transaction(pool: &DatabaseConnection) -> SeaORMTransactionAdapter {
+        SeaORMTransactionAdapter::new(pool.begin().await.unwrap())
+    }
+
     async fn create_test_user(pool: &DatabaseConnection) -> UserId {
-        let repo = SeaORMUserRepository::new(pool.clone());
-        let user = repo
-            .create_user("test@example.com", Some("Test User"))
+        let mut transaction = begin_transaction(pool).await;
+        let mut view = SeaORMTransaction::new(&mut transaction).unwrap();
+        let user = view
+            .users()
+            .create(NewUser {
+                id: UserId::new_random(),
+                email: "test@example.com".to_string(),
+                name: Some("Test User".to_string()),
+                email_verified_at: None,
+            })
             .await
             .unwrap();
+        transaction.into_inner().commit().await.unwrap();
         user.id
     }
 
@@ -222,7 +286,9 @@ mod tests {
         let session = create_test_session(&user_id);
         let original_token = session.token.clone();
 
-        let result = repo.create(session).await;
+        let mut transaction = begin_transaction(&pool).await;
+        let result = repo.create(&mut transaction, session).await;
+        transaction.into_inner().commit().await.unwrap();
         assert!(result.is_ok());
 
         let created_session = result.unwrap();
@@ -244,7 +310,9 @@ mod tests {
         let session = create_test_session(&user_id);
         let token = get_token(&session).clone();
 
-        let _created_session = repo.create(session).await.unwrap();
+        let mut transaction = begin_transaction(&pool).await;
+        let _created_session = repo.create(&mut transaction, session).await.unwrap();
+        transaction.into_inner().commit().await.unwrap();
 
         let found_session = repo.find_by_token(&token).await.unwrap();
         assert!(found_session.is_some());
@@ -274,9 +342,13 @@ mod tests {
         let session = create_test_session(&user_id);
         let token = get_token(&session).clone();
 
-        let _created_session = repo.create(session).await.unwrap();
+        let mut transaction = begin_transaction(&pool).await;
+        let _created_session = repo.create(&mut transaction, session).await.unwrap();
+        transaction.into_inner().commit().await.unwrap();
 
-        let result = repo.delete(&token).await;
+        let mut transaction = begin_transaction(&pool).await;
+        let result = repo.delete(&mut transaction, &token).await;
+        transaction.into_inner().commit().await.unwrap();
         assert!(result.is_ok());
 
         let found_session = repo.find_by_token(&token).await.unwrap();
@@ -294,10 +366,14 @@ mod tests {
         let token1 = get_token(&session1).clone();
         let token2 = get_token(&session2).clone();
 
-        let _created_session1 = repo.create(session1).await.unwrap();
-        let _created_session2 = repo.create(session2).await.unwrap();
+        let mut transaction = begin_transaction(&pool).await;
+        let _created_session1 = repo.create(&mut transaction, session1).await.unwrap();
+        let _created_session2 = repo.create(&mut transaction, session2).await.unwrap();
+        transaction.into_inner().commit().await.unwrap();
 
-        let result = repo.delete_by_user_id(&user_id).await;
+        let mut transaction = begin_transaction(&pool).await;
+        let result = repo.delete_by_user_id(&mut transaction, &user_id).await;
+        transaction.into_inner().commit().await.unwrap();
         assert!(result.is_ok());
 
         let found_session1 = repo.find_by_token(&token1).await.unwrap();
@@ -324,8 +400,13 @@ mod tests {
         let expired_token = get_token(&expired_session).clone();
         let valid_token = get_token(&valid_session).clone();
 
-        let _created_expired = repo.create(expired_session).await.unwrap();
-        let _created_valid = repo.create(valid_session).await.unwrap();
+        let mut transaction = begin_transaction(&pool).await;
+        let _created_expired = repo
+            .create(&mut transaction, expired_session)
+            .await
+            .unwrap();
+        let _created_valid = repo.create(&mut transaction, valid_session).await.unwrap();
+        transaction.into_inner().commit().await.unwrap();
 
         let result = repo.cleanup_expired().await;
         assert!(result.is_ok());

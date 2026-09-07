@@ -92,7 +92,7 @@ pub use types::{
 use axum::Router;
 use std::sync::Arc;
 use torii::Torii;
-use torii_core::RepositoryProvider;
+use torii_core::{RepositoryProvider, repositories::TransactionalRepositoryProvider};
 
 /// Create authentication routes for your Axum application.
 ///
@@ -115,7 +115,7 @@ use torii_core::RepositoryProvider;
 /// ```
 pub fn routes<R>(torii: Arc<Torii<R>>) -> AuthRouterBuilder<R>
 where
-    R: RepositoryProvider + 'static,
+    R: RepositoryProvider + TransactionalRepositoryProvider + 'static,
 {
     AuthRouterBuilder {
         torii,
@@ -125,13 +125,13 @@ where
 }
 
 /// Builder for configuring authentication routes
-pub struct AuthRouterBuilder<R: RepositoryProvider> {
+pub struct AuthRouterBuilder<R: RepositoryProvider + TransactionalRepositoryProvider> {
     torii: Arc<Torii<R>>,
     cookie_config: CookieConfig,
     link_config: Option<LinkConfig>,
 }
 
-impl<R: RepositoryProvider + 'static> AuthRouterBuilder<R> {
+impl<R: RepositoryProvider + TransactionalRepositoryProvider + 'static> AuthRouterBuilder<R> {
     /// Set custom cookie configuration
     pub fn with_cookie_config(mut self, config: CookieConfig) -> Self {
         self.cookie_config = config;
@@ -164,7 +164,8 @@ impl<R: RepositoryProvider + 'static> AuthRouterBuilder<R> {
     ///
     /// Panics if `magic-link` or `password` features are enabled but `LinkConfig`
     /// is not provided via `with_link_config()`.
-    pub fn build(self) -> Router {
+    pub fn build(self) -> Router
+where {
         #[cfg(any(feature = "magic-link", feature = "password"))]
         if self.link_config.is_none() {
             panic!(
@@ -177,7 +178,10 @@ impl<R: RepositoryProvider + 'static> AuthRouterBuilder<R> {
     }
 }
 
-impl<R: RepositoryProvider + 'static> From<AuthRouterBuilder<R>> for Router {
+impl<R> From<AuthRouterBuilder<R>> for Router
+where
+    R: RepositoryProvider + TransactionalRepositoryProvider + 'static,
+{
     fn from(builder: AuthRouterBuilder<R>) -> Self {
         builder.build()
     }

@@ -29,7 +29,11 @@ mod tests {
             .email("test@test.com".to_string())
             .build()
             .unwrap();
-        user_repo.create(user).await.unwrap()
+        let transaction = storage.pool.begin().await.unwrap();
+        let mut adapter = crate::SqliteTransactionAdapter { transaction };
+        let user = user_repo.create(&mut adapter, user).await.unwrap();
+        adapter.transaction.commit().await.unwrap();
+        user
     }
 
     async fn add_passkey(

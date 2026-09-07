@@ -51,7 +51,7 @@ impl<S: SessionRepository> SessionProvider for OpaqueSessionProvider<S> {
 
         let session = self
             .storage
-            .create(session)
+            .create(&mut crate::NoopTransactionAdapter, session)
             .await
             .map_err(|e| StorageError::Database(e.to_string()))?;
 
@@ -78,7 +78,7 @@ impl<S: SessionRepository> SessionProvider for OpaqueSessionProvider<S> {
 
     async fn delete_session(&self, token: &SessionToken) -> Result<(), Error> {
         self.storage
-            .delete(token)
+            .delete(&mut crate::NoopTransactionAdapter, token)
             .await
             .map_err(|e| StorageError::Database(e.to_string()))?;
 
@@ -96,7 +96,7 @@ impl<S: SessionRepository> SessionProvider for OpaqueSessionProvider<S> {
 
     async fn delete_sessions_for_user(&self, user_id: &UserId) -> Result<(), Error> {
         self.storage
-            .delete_by_user_id(user_id)
+            .delete_by_user_id(&mut crate::NoopTransactionAdapter, user_id)
             .await
             .map_err(|e| StorageError::Database(e.to_string()))?;
 
@@ -116,7 +116,7 @@ impl<S: SessionRepository> SessionProvider for OpaqueSessionProvider<S> {
         duration: Duration,
     ) -> Result<Session, Error> {
         self.storage
-            .refresh(token, duration)
+            .refresh(&mut crate::NoopTransactionAdapter, token, duration)
             .await
             .map_err(|e| StorageError::Database(e.to_string()).into())
     }

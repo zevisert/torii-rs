@@ -14,7 +14,7 @@ use axum_extra::extract::{
 use chrono::{DateTime, Utc};
 use cookie::time::Duration;
 use torii::Torii;
-use torii_core::RepositoryProvider;
+use torii_core::{RepositoryProvider, repositories::TransactionalRepositoryProvider};
 
 use crate::{
     error::{AuthError, Result},
@@ -57,7 +57,7 @@ pub fn create_router<R>(
     link_config: Option<LinkConfig>,
 ) -> Router
 where
-    R: RepositoryProvider + 'static,
+    R: RepositoryProvider + TransactionalRepositoryProvider + 'static,
 {
     let state = torii;
 
@@ -107,7 +107,7 @@ where
 
 async fn health_handler<R>(State(state): State<Arc<Torii<R>>>) -> Result<impl IntoResponse>
 where
-    R: RepositoryProvider,
+    R: RepositoryProvider + TransactionalRepositoryProvider,
 {
     state
         .torii()
@@ -126,7 +126,7 @@ async fn get_session_handler<R>(
     SessionTokenFromCookie(session_token): SessionTokenFromCookie,
 ) -> Result<impl IntoResponse>
 where
-    R: RepositoryProvider,
+    R: RepositoryProvider + TransactionalRepositoryProvider,
 {
     let session_token = session_token.ok_or(AuthError::Unauthorized)?;
 
@@ -152,7 +152,7 @@ async fn logout_handler<R>(
     SessionTokenFromCookie(session_token): SessionTokenFromCookie,
 ) -> Result<impl IntoResponse>
 where
-    R: RepositoryProvider,
+    R: RepositoryProvider + TransactionalRepositoryProvider,
 {
     if let Some(session_token) = session_token {
         let _ = state.torii().delete_session(&session_token).await;
@@ -171,7 +171,7 @@ where
 #[cfg(feature = "password")]
 fn password_routes<R>() -> Router<Arc<Torii<R>>>
 where
-    R: RepositoryProvider + 'static,
+    R: RepositoryProvider + TransactionalRepositoryProvider + 'static,
 {
     Router::new()
         .route(torii_client::path::REGISTER, post(register_handler))
@@ -190,7 +190,7 @@ async fn register_handler<R>(
     Json(payload): Json<RegisterRequest>,
 ) -> Result<impl IntoResponse>
 where
-    R: RepositoryProvider,
+    R: RepositoryProvider + TransactionalRepositoryProvider,
 {
     // Register returns the user whether newly created or existing.
     // This prevents user enumeration attacks.
@@ -234,7 +234,7 @@ pub async fn login_handler<R>(
     Json(payload): Json<LoginRequest>,
 ) -> Result<impl IntoResponse>
 where
-    R: RepositoryProvider,
+    R: RepositoryProvider + TransactionalRepositoryProvider,
 {
     let (user, session) = state
         .torii()
@@ -267,7 +267,7 @@ where
 #[cfg(any(feature = "password", feature = "magic-link"))]
 fn password_reset_routes<R>() -> Router<Arc<Torii<R>>>
 where
-    R: RepositoryProvider + 'static,
+    R: RepositoryProvider + TransactionalRepositoryProvider + 'static,
 {
     Router::new()
         .route(
@@ -291,7 +291,7 @@ async fn request_password_reset_handler<R>(
     Json(payload): Json<PasswordResetRequest>,
 ) -> Result<impl IntoResponse>
 where
-    R: RepositoryProvider,
+    R: RepositoryProvider + TransactionalRepositoryProvider,
 {
     // Generate a temporary token to build the URL
     // The actual token will be generated and sent by reset_password_initiate
@@ -320,7 +320,7 @@ async fn verify_reset_token_handler<R>(
     Json(payload): Json<VerifyResetTokenRequest>,
 ) -> Result<impl IntoResponse>
 where
-    R: RepositoryProvider,
+    R: RepositoryProvider + TransactionalRepositoryProvider,
 {
     let valid = state
         .torii()
@@ -337,7 +337,7 @@ async fn reset_password_handler<R>(
     Json(payload): Json<ResetPasswordRequest>,
 ) -> Result<impl IntoResponse>
 where
-    R: RepositoryProvider,
+    R: RepositoryProvider + TransactionalRepositoryProvider,
 {
     let user = state
         .torii()
@@ -355,7 +355,7 @@ async fn change_password_handler<R>(
     Json(payload): Json<ChangePasswordRequest>,
 ) -> Result<impl IntoResponse>
 where
-    R: RepositoryProvider,
+    R: RepositoryProvider + TransactionalRepositoryProvider,
 {
     state
         .torii()
@@ -371,7 +371,7 @@ where
 #[cfg(feature = "magic-link")]
 fn magic_link_routes<R>() -> Router<Arc<Torii<R>>>
 where
-    R: RepositoryProvider + 'static,
+    R: RepositoryProvider + TransactionalRepositoryProvider + 'static,
 {
     Router::new()
         .route(
@@ -391,7 +391,7 @@ async fn request_magic_link_handler<R>(
     Json(payload): Json<MagicLinkRequest>,
 ) -> Result<impl IntoResponse>
 where
-    R: RepositoryProvider,
+    R: RepositoryProvider + TransactionalRepositoryProvider,
 {
     // Build the base URL for the magic link (without the token)
     let magic_link_url_base = format!(
@@ -421,7 +421,7 @@ async fn verify_magic_link_handler<R>(
     Json(payload): Json<VerifyMagicTokenRequest>,
 ) -> Result<impl IntoResponse>
 where
-    R: RepositoryProvider,
+    R: RepositoryProvider + TransactionalRepositoryProvider,
 {
     let (user, session) = state
         .torii()

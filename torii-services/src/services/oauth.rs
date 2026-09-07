@@ -1,10 +1,9 @@
-use crate::{EventBus, EventEmitter, services::UserService};
+use crate::services::UserService;
 use chrono::Duration;
 use std::sync::Arc;
 use torii_core::{
     Error, OAuthAccount, User, UserId,
     error::AuthError,
-    events::Event,
     repositories::{OAuthRepository, UserRepository},
 };
 
@@ -12,7 +11,6 @@ use torii_core::{
 pub struct OAuthService<U: UserRepository, O: OAuthRepository> {
     user_service: Arc<UserService<U>>,
     oauth_repository: Arc<O>,
-    event_bus: Option<Arc<EventBus>>,
 }
 
 impl<U: UserRepository, O: OAuthRepository> OAuthService<U, O> {
@@ -22,19 +20,13 @@ impl<U: UserRepository, O: OAuthRepository> OAuthService<U, O> {
         Self {
             user_service,
             oauth_repository,
-            event_bus: None,
         }
-    }
-
-    /// Enable OAuth event emission.
-    pub fn with_event_bus(mut self, event_bus: Arc<EventBus>) -> Self {
-        self.event_bus = Some(event_bus);
-        self
     }
 
     /// Create or get a user from OAuth provider information
     pub async fn get_or_create_user(
         &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
         provider: &str,
         subject: &str,
         email: &str,
@@ -53,26 +45,23 @@ impl<U: UserRepository, O: OAuthRepository> OAuthService<U, O> {
         let user = if let Some(existing_user) = self.user_service.get_user_by_email(email).await? {
             // Link existing user to OAuth account
             self.oauth_repository
-                .link_account(&existing_user.id, provider, subject)
+                .link_account(transaction, &existing_user.id, provider, subject)
                 .await?;
             existing_user
         } else {
             // Create new user (email validation happens in UserService)
-            let new_user = self.user_service.create_user(email, name).await?;
+            let new_user = self
+                .user_service
+                .create_user(transaction, email, name)
+                .await?;
 
             // Create OAuth account
             self.oauth_repository
-                .create_account(provider, subject, &new_user.id)
+                .create_account(transaction, provider, subject, &new_user.id)
                 .await?;
 
             new_user
         };
-
-        self.emit_event(Event::OAuthAuthenticated {
-            user_id: user.id.clone(),
-            provider: provider.to_string(),
-        })
-        .await?;
 
         Ok(user)
     }
@@ -80,6 +69,7 @@ impl<U: UserRepository, O: OAuthRepository> OAuthService<U, O> {
     /// Link an existing user to an OAuth account
     pub async fn link_account(
         &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
         user_id: &UserId,
         provider: &str,
         subject: &str,
@@ -95,36 +85,36 @@ impl<U: UserRepository, O: OAuthRepository> OAuthService<U, O> {
         }
 
         self.oauth_repository
-            .link_account(user_id, provider, subject)
+            .link_account(transaction, user_id, provider, subject)
             .await?;
-        self.emit_event(Event::OAuthAccountLinked {
-            user_id: user_id.clone(),
-            provider: provider.to_string(),
-        })
-        .await?;
         Ok(())
     }
 
     /// Store a PKCE verifier
     pub async fn store_pkce_verifier(
         &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
         csrf_state: &str,
         pkce_verifier: &str,
         expires_in: Duration,
     ) -> Result<(), Error> {
         self.oauth_repository
-            .store_pkce_verifier(csrf_state, pkce_verifier, expires_in)
+            .store_pkce_verifier(transaction, csrf_state, pkce_verifier, expires_in)
             .await
     }
 
     /// Get and consume a PKCE verifier
-    pub async fn get_pkce_verifier(&self, csrf_state: &str) -> Result<Option<String>, Error> {
+    pub async fn get_pkce_verifier(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        csrf_state: &str,
+    ) -> Result<Option<String>, Error> {
         let verifier = self.oauth_repository.get_pkce_verifier(csrf_state).await?;
 
         if verifier.is_some() {
             // Delete the verifier after retrieving it (one-time use)
             self.oauth_repository
-                .delete_pkce_verifier(csrf_state)
+                .delete_pkce_verifier(transaction, csrf_state)
                 .await?;
         }
 
@@ -153,23 +143,16 @@ impl<U: UserRepository, O: OAuthRepository> OAuthService<U, O> {
     }
 
     /// Unlink an OAuth provider from a user
-    pub async fn unlink_account(&self, user_id: &UserId, provider: &str) -> Result<(), Error> {
+    pub async fn unlink_account(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        user_id: &UserId,
+        provider: &str,
+    ) -> Result<(), Error> {
         self.oauth_repository
-            .unlink_account(user_id, provider)
+            .unlink_account(transaction, user_id, provider)
             .await?;
-        self.emit_event(Event::OAuthAccountUnlinked {
-            user_id: user_id.clone(),
-            provider: provider.to_string(),
-        })
-        .await?;
         Ok(())
-    }
-}
-
-#[async_trait::async_trait]
-impl<U: UserRepository, O: OAuthRepository> EventEmitter for OAuthService<U, O> {
-    fn event_bus(&self) -> Option<&Arc<EventBus>> {
-        self.event_bus.as_ref()
     }
 }
 
@@ -216,7 +199,11 @@ mod tests {
 
     #[async_trait]
     impl UserRepository for MockUserRepository {
-        async fn create(&self, new_user: torii_core::storage::NewUser) -> Result<User, Error> {
+        async fn create(
+            &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
+            new_user: torii_core::storage::NewUser,
+        ) -> Result<User, Error> {
             let user = MockUser {
                 id: UserId::new_random(),
                 email: new_user.email.clone(),
@@ -258,19 +245,32 @@ mod tests {
                     .email(email.to_string())
                     .build()
                     .unwrap();
-                self.create(new_user).await
+                self.create(&mut torii_core::NoopTransactionAdapter, new_user)
+                    .await
             }
         }
 
-        async fn update(&self, _user: &User) -> Result<User, Error> {
+        async fn update(
+            &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
+            _user: &User,
+        ) -> Result<User, Error> {
             unimplemented!()
         }
 
-        async fn delete(&self, _id: &UserId) -> Result<(), Error> {
+        async fn delete(
+            &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
+            _id: &UserId,
+        ) -> Result<(), Error> {
             unimplemented!()
         }
 
-        async fn mark_email_verified(&self, _user_id: &UserId) -> Result<(), Error> {
+        async fn mark_email_verified(
+            &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
+            _user_id: &UserId,
+        ) -> Result<(), Error> {
             Ok(())
         }
     }
@@ -288,6 +288,7 @@ mod tests {
     impl OAuthRepository for MockOAuthRepository {
         async fn create_account(
             &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
             provider: &str,
             subject: &str,
             user_id: &UserId,
@@ -353,6 +354,7 @@ mod tests {
 
         async fn link_account(
             &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
             user_id: &UserId,
             provider: &str,
             subject: &str,
@@ -366,6 +368,7 @@ mod tests {
 
         async fn store_pkce_verifier(
             &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
             csrf_state: &str,
             pkce_verifier: &str,
             expires_in: Duration,
@@ -391,7 +394,11 @@ mod tests {
             }
         }
 
-        async fn delete_pkce_verifier(&self, csrf_state: &str) -> Result<(), Error> {
+        async fn delete_pkce_verifier(
+            &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
+            csrf_state: &str,
+        ) -> Result<(), Error> {
             self.pkce_verifiers.lock().await.remove(csrf_state);
             Ok(())
         }
@@ -409,7 +416,12 @@ mod tests {
             Ok(result)
         }
 
-        async fn unlink_account(&self, user_id: &UserId, provider: &str) -> Result<(), Error> {
+        async fn unlink_account(
+            &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
+            user_id: &UserId,
+            provider: &str,
+        ) -> Result<(), Error> {
             let mut accounts = self.accounts.lock().await;
             let mut user_links = self.user_links.lock().await;
 
@@ -436,6 +448,7 @@ mod tests {
 
         let result = service
             .get_or_create_user(
+                &mut torii_core::NoopTransactionAdapter,
                 "google",
                 "123",
                 "test@example.com",
@@ -458,12 +471,23 @@ mod tests {
         // First create an OAuth account
         let user_id = UserId::new_random();
         oauth_repo
-            .create_account("google", "123", &user_id)
+            .create_account(
+                &mut torii_core::NoopTransactionAdapter,
+                "google",
+                "123",
+                &user_id,
+            )
             .await
             .unwrap();
 
         let result = service
-            .get_or_create_user("google", "123", "test@example.com", None)
+            .get_or_create_user(
+                &mut torii_core::NoopTransactionAdapter,
+                "google",
+                "123",
+                "test@example.com",
+                None,
+            )
             .await;
         assert!(result.is_ok());
 
@@ -478,7 +502,14 @@ mod tests {
         let service = OAuthService::new(user_repo, oauth_repo);
 
         let user_id = UserId::new_random();
-        let result = service.link_account(&user_id, "github", "456").await;
+        let result = service
+            .link_account(
+                &mut torii_core::NoopTransactionAdapter,
+                &user_id,
+                "github",
+                "456",
+            )
+            .await;
         assert!(result.is_ok());
     }
 
@@ -491,13 +522,25 @@ mod tests {
         let user_id = UserId::new_random();
         // First link the account
         oauth_repo
-            .create_account("github", "456", &user_id)
+            .create_account(
+                &mut torii_core::NoopTransactionAdapter,
+                "github",
+                "456",
+                &user_id,
+            )
             .await
             .unwrap();
 
         // Try to link again with different user
         let other_user_id = UserId::new_random();
-        let result = service.link_account(&other_user_id, "github", "456").await;
+        let result = service
+            .link_account(
+                &mut torii_core::NoopTransactionAdapter,
+                &other_user_id,
+                "github",
+                "456",
+            )
+            .await;
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -517,17 +560,26 @@ mod tests {
 
         // Store the verifier
         let result = service
-            .store_pkce_verifier(csrf_state, pkce_verifier, expires_in)
+            .store_pkce_verifier(
+                &mut torii_core::NoopTransactionAdapter,
+                csrf_state,
+                pkce_verifier,
+                expires_in,
+            )
             .await;
         assert!(result.is_ok());
 
         // Get the verifier
-        let result = service.get_pkce_verifier(csrf_state).await;
+        let result = service
+            .get_pkce_verifier(&mut torii_core::NoopTransactionAdapter, csrf_state)
+            .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), Some(pkce_verifier.to_string()));
 
         // Verify it's been consumed (should be None now)
-        let result = service.get_pkce_verifier(csrf_state).await;
+        let result = service
+            .get_pkce_verifier(&mut torii_core::NoopTransactionAdapter, csrf_state)
+            .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), None);
     }
@@ -540,7 +592,12 @@ mod tests {
 
         let user_id = UserId::new_random();
         oauth_repo
-            .create_account("twitter", "789", &user_id)
+            .create_account(
+                &mut torii_core::NoopTransactionAdapter,
+                "twitter",
+                "789",
+                &user_id,
+            )
             .await
             .unwrap();
 

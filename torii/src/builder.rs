@@ -35,6 +35,8 @@ use std::sync::Arc;
 use chrono::Duration;
 use torii_core::{BruteForceProtectionConfig, RepositoryProvider};
 
+use torii_services::{HookRegistry, ToriiHook};
+
 use crate::{JwtConfig, SessionConfig, SessionProviderType, Torii};
 
 #[cfg(feature = "mailer")]
@@ -120,9 +122,9 @@ pub struct ToriiBuilder<Storage> {
     session_config: SessionConfig,
     brute_force_config: BruteForceProtectionConfig,
     apply_migrations: bool,
+    hook_registry: HookRegistry,
     #[cfg(feature = "mailer")]
     mailer_config: Option<MailerConfig>,
-    // PhantomData not needed since we store Storage directly
 }
 
 impl Default for ToriiBuilder<NoStorage> {
@@ -147,6 +149,7 @@ impl ToriiBuilder<NoStorage> {
             session_config: SessionConfig::default(),
             brute_force_config: BruteForceProtectionConfig::default(),
             apply_migrations: false,
+            hook_registry: HookRegistry::new(),
             #[cfg(feature = "mailer")]
             mailer_config: None,
         }
@@ -197,6 +200,7 @@ impl ToriiBuilder<NoStorage> {
             session_config: self.session_config,
             brute_force_config: self.brute_force_config,
             apply_migrations: self.apply_migrations,
+            hook_registry: self.hook_registry,
             #[cfg(feature = "mailer")]
             mailer_config: self.mailer_config,
         })
@@ -238,6 +242,7 @@ impl ToriiBuilder<NoStorage> {
             session_config: self.session_config,
             brute_force_config: self.brute_force_config,
             apply_migrations: self.apply_migrations,
+            hook_registry: self.hook_registry,
             #[cfg(feature = "mailer")]
             mailer_config: self.mailer_config,
         }
@@ -286,6 +291,7 @@ impl ToriiBuilder<NoStorage> {
             session_config: self.session_config,
             brute_force_config: self.brute_force_config,
             apply_migrations: self.apply_migrations,
+            hook_registry: self.hook_registry,
             #[cfg(feature = "mailer")]
             mailer_config: self.mailer_config,
         })
@@ -327,6 +333,7 @@ impl ToriiBuilder<NoStorage> {
             session_config: self.session_config,
             brute_force_config: self.brute_force_config,
             apply_migrations: self.apply_migrations,
+            hook_registry: self.hook_registry,
             #[cfg(feature = "mailer")]
             mailer_config: self.mailer_config,
         }
@@ -382,6 +389,7 @@ impl ToriiBuilder<NoStorage> {
             session_config: self.session_config,
             brute_force_config: self.brute_force_config,
             apply_migrations: self.apply_migrations,
+            hook_registry: self.hook_registry,
             #[cfg(feature = "mailer")]
             mailer_config: self.mailer_config,
         })
@@ -423,6 +431,7 @@ impl ToriiBuilder<NoStorage> {
             session_config: self.session_config,
             brute_force_config: self.brute_force_config,
             apply_migrations: self.apply_migrations,
+            hook_registry: self.hook_registry,
             #[cfg(feature = "mailer")]
             mailer_config: self.mailer_config,
         }
@@ -433,7 +442,9 @@ impl ToriiBuilder<NoStorage> {
 // Configuration Methods (available after storage is configured)
 // ============================================================================
 
-impl<R: RepositoryProvider> ToriiBuilder<WithStorage<R>> {
+impl<R: RepositoryProvider + torii_core::repositories::TransactionalRepositoryProvider>
+    ToriiBuilder<WithStorage<R>>
+{
     /// Set the session expiration duration.
     ///
     /// Default: 30 days
@@ -573,6 +584,15 @@ impl<R: RepositoryProvider> ToriiBuilder<WithStorage<R>> {
         self
     }
 
+    /// Register a lifecycle hook. Hooks execute in registration order.
+    ///
+    /// Hook objects are immutable after construction. Use `Arc` to share
+    /// application state such as policy services or tenant configuration.
+    pub fn register_hook(self, hook: Arc<dyn ToriiHook>) -> Self {
+        self.hook_registry.register_sync(hook);
+        self
+    }
+
     /// Configure the mailer service for sending authentication emails.
     ///
     /// The mailer is used for sending welcome emails, password reset emails,
@@ -672,6 +692,7 @@ impl<R: RepositoryProvider> ToriiBuilder<WithStorage<R>> {
             self.storage.repositories,
             self.session_config,
             self.brute_force_config,
+            self.hook_registry,
             #[cfg(feature = "mailer")]
             self.mailer_config,
         )?;

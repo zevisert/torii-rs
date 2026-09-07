@@ -1,13 +1,9 @@
-use crate::{
-    EventBus, EventEmitter,
-    services::{PasswordService, UserService},
-};
+use crate::services::{PasswordService, UserService};
 use chrono::Duration;
 use std::sync::Arc;
 use torii_core::{
     Error, User,
     error::AuthError,
-    events::Event,
     repositories::{PasswordRepository, TokenRepository, UserRepository},
     storage::TokenPurpose,
     validation::validate_password,
@@ -18,7 +14,6 @@ pub struct PasswordResetService<U: UserRepository, P: PasswordRepository, T: Tok
     user_service: Arc<UserService<U>>,
     password_service: Arc<PasswordService<U, P>>,
     token_repository: Arc<T>,
-    event_bus: Option<Arc<EventBus>>,
 }
 
 impl<U: UserRepository, P: PasswordRepository, T: TokenRepository> PasswordResetService<U, P, T> {
@@ -35,14 +30,7 @@ impl<U: UserRepository, P: PasswordRepository, T: TokenRepository> PasswordReset
             user_service,
             password_service,
             token_repository,
-            event_bus: None,
         }
-    }
-
-    /// Enable password reset event emission.
-    pub fn with_event_bus(mut self, event_bus: Arc<EventBus>) -> Self {
-        self.event_bus = Some(event_bus);
-        self
     }
 
     /// Request a password reset for the given email address
@@ -65,7 +53,12 @@ impl<U: UserRepository, P: PasswordRepository, T: TokenRepository> PasswordReset
             let expires_in = Duration::minutes(15);
             let reset_token = self
                 .token_repository
-                .create_token(&user.id, TokenPurpose::PasswordReset, expires_in)
+                .create_token(
+                    &mut torii_core::NoopTransactionAdapter,
+                    &user.id,
+                    TokenPurpose::PasswordReset,
+                    expires_in,
+                )
                 .await?;
 
             // Extract the plaintext token to return to the caller
@@ -73,9 +66,6 @@ impl<U: UserRepository, P: PasswordRepository, T: TokenRepository> PasswordReset
                 .token()
                 .expect("Token should be available after creation")
                 .to_string();
-
-            self.emit_event(Event::PasswordResetRequested(user.id.clone()))
-                .await?;
 
             Ok(Some((user, token_value)))
         } else {
@@ -94,7 +84,12 @@ impl<U: UserRepository, P: PasswordRepository, T: TokenRepository> PasswordReset
         if let Some(user) = user {
             let reset_token = self
                 .token_repository
-                .create_token(&user.id, TokenPurpose::PasswordReset, expires_in)
+                .create_token(
+                    &mut torii_core::NoopTransactionAdapter,
+                    &user.id,
+                    TokenPurpose::PasswordReset,
+                    expires_in,
+                )
                 .await?;
 
             // Extract the plaintext token to return to the caller
@@ -134,7 +129,11 @@ impl<U: UserRepository, P: PasswordRepository, T: TokenRepository> PasswordReset
         // Verify and consume the token
         let secure_token = self
             .token_repository
-            .verify_token(token, TokenPurpose::PasswordReset)
+            .verify_token(
+                &mut torii_core::NoopTransactionAdapter,
+                token,
+                TokenPurpose::PasswordReset,
+            )
             .await?;
 
         let secure_token = secure_token.ok_or(Error::Auth(AuthError::InvalidCredentials))?;
@@ -151,24 +150,12 @@ impl<U: UserRepository, P: PasswordRepository, T: TokenRepository> PasswordReset
             .set_password(&user.id, new_password)
             .await?;
 
-        self.emit_event(Event::PasswordResetCompleted(user.id.clone()))
-            .await?;
-
         Ok(user)
     }
 
     /// Clean up expired reset tokens
     pub async fn cleanup_expired_tokens(&self) -> Result<(), Error> {
         self.token_repository.cleanup_expired_tokens().await
-    }
-}
-
-#[async_trait::async_trait]
-impl<U: UserRepository, P: PasswordRepository, T: TokenRepository> EventEmitter
-    for PasswordResetService<U, P, T>
-{
-    fn event_bus(&self) -> Option<&Arc<EventBus>> {
-        self.event_bus.as_ref()
     }
 }
 
@@ -216,7 +203,11 @@ mod tests {
 
     #[async_trait]
     impl UserRepository for MockUserRepository {
-        async fn create(&self, new_user: NewUser) -> Result<User, Error> {
+        async fn create(
+            &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
+            new_user: NewUser,
+        ) -> Result<User, Error> {
             let user = MockUser {
                 id: UserId::new_random(),
                 email: new_user.email.clone(),
@@ -255,19 +246,32 @@ mod tests {
                 Ok(user)
             } else {
                 let new_user = NewUser::builder().email(email.to_string()).build().unwrap();
-                self.create(new_user).await
+                self.create(&mut torii_core::NoopTransactionAdapter, new_user)
+                    .await
             }
         }
 
-        async fn update(&self, _user: &User) -> Result<User, Error> {
+        async fn update(
+            &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
+            _user: &User,
+        ) -> Result<User, Error> {
             unimplemented!()
         }
 
-        async fn delete(&self, _id: &UserId) -> Result<(), Error> {
+        async fn delete(
+            &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
+            _id: &UserId,
+        ) -> Result<(), Error> {
             unimplemented!()
         }
 
-        async fn mark_email_verified(&self, _user_id: &UserId) -> Result<(), Error> {
+        async fn mark_email_verified(
+            &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
+            _user_id: &UserId,
+        ) -> Result<(), Error> {
             Ok(())
         }
     }
@@ -307,6 +311,7 @@ mod tests {
     impl TokenRepository for MockTokenRepository {
         async fn create_token(
             &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
             user_id: &UserId,
             purpose: TokenPurpose,
             expires_in: Duration,
@@ -338,6 +343,7 @@ mod tests {
 
         async fn verify_token(
             &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
             token: &str,
             purpose: TokenPurpose,
         ) -> Result<Option<SecureToken>, Error> {
@@ -399,6 +405,7 @@ mod tests {
         // Create a user first
         let _user = user_repo
             .create(
+                &mut torii_core::NoopTransactionAdapter,
                 NewUser::builder()
                     .email("test@example.com".to_string())
                     .build()
@@ -447,6 +454,7 @@ mod tests {
         // Create a user first
         let user = user_repo
             .create(
+                &mut torii_core::NoopTransactionAdapter,
                 NewUser::builder()
                     .email("test@example.com".to_string())
                     .build()
@@ -460,7 +468,12 @@ mod tests {
 
         // Create a token directly for testing
         let token = token_repo
-            .create_token(&user.id, TokenPurpose::PasswordReset, Duration::minutes(15))
+            .create_token(
+                &mut torii_core::NoopTransactionAdapter,
+                &user.id,
+                TokenPurpose::PasswordReset,
+                Duration::minutes(15),
+            )
             .await
             .unwrap();
 
@@ -487,6 +500,7 @@ mod tests {
         // Create a user first
         let user = user_repo
             .create(
+                &mut torii_core::NoopTransactionAdapter,
                 NewUser::builder()
                     .email("test@example.com".to_string())
                     .build()
@@ -499,7 +513,12 @@ mod tests {
 
         // Create a token
         let token = token_repo
-            .create_token(&user.id, TokenPurpose::PasswordReset, Duration::minutes(15))
+            .create_token(
+                &mut torii_core::NoopTransactionAdapter,
+                &user.id,
+                TokenPurpose::PasswordReset,
+                Duration::minutes(15),
+            )
             .await
             .unwrap();
 
@@ -527,6 +546,7 @@ mod tests {
         // Create a user first
         let user = user_repo
             .create(
+                &mut torii_core::NoopTransactionAdapter,
                 NewUser::builder()
                     .email("test@example.com".to_string())
                     .build()
@@ -540,7 +560,12 @@ mod tests {
 
         // Create a token
         let token = token_repo
-            .create_token(&user.id, TokenPurpose::PasswordReset, Duration::minutes(15))
+            .create_token(
+                &mut torii_core::NoopTransactionAdapter,
+                &user.id,
+                TokenPurpose::PasswordReset,
+                Duration::minutes(15),
+            )
             .await
             .unwrap();
 
@@ -576,6 +601,7 @@ mod tests {
         // Create a user first
         let user = user_repo
             .create(
+                &mut torii_core::NoopTransactionAdapter,
                 NewUser::builder()
                     .email("test@example.com".to_string())
                     .build()
@@ -589,7 +615,12 @@ mod tests {
 
         // Create a token directly for testing
         let token = token_repo
-            .create_token(&user.id, TokenPurpose::PasswordReset, Duration::minutes(15))
+            .create_token(
+                &mut torii_core::NoopTransactionAdapter,
+                &user.id,
+                TokenPurpose::PasswordReset,
+                Duration::minutes(15),
+            )
             .await
             .unwrap();
 
@@ -624,6 +655,7 @@ mod tests {
         // Create a user first
         let user = user_repo
             .create(
+                &mut torii_core::NoopTransactionAdapter,
                 NewUser::builder()
                     .email("test@example.com".to_string())
                     .build()
@@ -637,7 +669,12 @@ mod tests {
 
         // Create a token
         let token = token_repo
-            .create_token(&user.id, TokenPurpose::PasswordReset, Duration::minutes(15))
+            .create_token(
+                &mut torii_core::NoopTransactionAdapter,
+                &user.id,
+                TokenPurpose::PasswordReset,
+                Duration::minutes(15),
+            )
             .await
             .unwrap();
 

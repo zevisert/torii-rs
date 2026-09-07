@@ -60,6 +60,7 @@ mod passkey;
 mod password;
 mod repositories;
 mod session;
+pub mod transaction;
 
 use chrono::DateTime;
 use migrations::{
@@ -67,12 +68,74 @@ use migrations::{
     CreatePasskeyChallengesTable, CreatePasskeysTable, CreateSessionsTable, CreateUsersTable,
     SqliteMigrationManager,
 };
-use sqlx::SqlitePool;
+use sqlx::{Sqlite, SqlitePool, Transaction};
+use torii_core::UserId;
 use torii_core::error::StorageError;
-use torii_core::{User, UserId};
+use torii_core::{
+    TransactionAdapter, TransactionError, TransactionOperation, TransactionRunner,
+    TransactionRunnerProvider, User,
+};
 use torii_migration::{Migration, MigrationManager};
 
-pub use repositories::SqliteRepositoryProvider;
+pub use repositories::{SqlitePasswordRepository, SqliteRepositoryProvider, SqliteUserRepository};
+pub use transaction::{
+    SqliteTransactionBruteForce, SqliteTransactionOAuth, SqliteTransactionPasskeys,
+    SqliteTransactionPasswords, SqliteTransactionSessions, SqliteTransactionTokens,
+    SqliteTransactionUsers, SqliteTransactionView,
+};
+
+pub struct SqliteTransactionAdapter {
+    pub transaction: Transaction<'static, Sqlite>,
+}
+impl TransactionAdapter for SqliteTransactionAdapter {
+    fn backend(&self) -> &'static str {
+        "sqlite"
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+pub struct SqliteTransactionRunner {
+    pool: SqlitePool,
+}
+impl SqliteTransactionRunner {
+    pub fn new(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+}
+#[async_trait::async_trait]
+impl TransactionRunner for SqliteTransactionRunner {
+    async fn run<T: Send + 'static>(
+        &self,
+        operation: Box<dyn TransactionOperation<T>>,
+    ) -> Result<T, TransactionError> {
+        let transaction = sqlx::Acquire::begin(&self.pool)
+            .await
+            .map_err(|e| TransactionError::Failed(e.to_string()))?;
+        let mut adapter = SqliteTransactionAdapter { transaction };
+        match operation.execute(&mut adapter).await {
+            Ok(value) => {
+                adapter
+                    .transaction
+                    .commit()
+                    .await
+                    .map_err(|e| TransactionError::Failed(e.to_string()))?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = adapter.transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+}
+impl TransactionRunnerProvider for SqliteRepositoryProvider {
+    type TransactionRunner = SqliteTransactionRunner;
+    fn transaction_runner(&self) -> Self::TransactionRunner {
+        SqliteTransactionRunner::new(self.database_pool())
+    }
+}
 
 #[derive(Clone)]
 pub struct SqliteStorage {
@@ -127,12 +190,14 @@ impl SqliteStorage {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct SqliteUser {
     id: String,
-    email: String,
     name: Option<String>,
+    email: String,
     email_verified_at: Option<i64>,
-    locked_at: Option<i64>,
+    #[allow(dead_code)]
+    password_hash: Option<String>,
     created_at: i64,
     updated_at: i64,
+    locked_at: Option<i64>,
 }
 
 impl From<SqliteUser> for User {
@@ -159,14 +224,15 @@ impl From<User> for SqliteUser {
     fn from(user: User) -> Self {
         SqliteUser {
             id: user.id.into_inner(),
-            email: user.email,
             name: user.name,
+            email: user.email,
             email_verified_at: user
                 .email_verified_at
                 .map(|timestamp| timestamp.timestamp()),
-            locked_at: user.locked_at.map(|timestamp| timestamp.timestamp()),
+            password_hash: None,
             created_at: user.created_at.timestamp(),
             updated_at: user.updated_at.timestamp(),
+            locked_at: user.locked_at.map(|timestamp| timestamp.timestamp()),
         }
     }
 }
@@ -215,15 +281,24 @@ mod tests {
         id: &str,
     ) -> Result<User, torii_core::Error> {
         let user_repo = SqliteUserRepository::new(storage.pool.clone());
-        user_repo
+        let transaction = storage.pool.begin().await.map_err(|error| {
+            torii_core::Error::Storage(torii_core::error::StorageError::Database(error.to_string()))
+        })?;
+        let mut adapter = SqliteTransactionAdapter { transaction };
+        let user = user_repo
             .create(
+                &mut adapter,
                 NewUser::builder()
                     .id(UserId::new(id))
                     .email(format!("test{id}@example.com"))
                     .build()
                     .expect("Failed to build user"),
             )
-            .await
+            .await?;
+        adapter.transaction.commit().await.map_err(|error| {
+            torii_core::Error::Storage(torii_core::error::StorageError::Database(error.to_string()))
+        })?;
+        Ok(user)
     }
 
     #[tokio::test]
@@ -236,7 +311,7 @@ mod tests {
         let user = create_test_user(&storage, "1")
             .await
             .expect("Failed to create user");
-        assert_eq!(user.email, format!("test1@example.com"));
+        assert_eq!(user.email, "test1@example.com");
 
         let fetched = user_repo
             .find_by_id(&UserId::new("1"))
@@ -244,13 +319,16 @@ mod tests {
             .expect("Failed to get user");
         assert_eq!(
             fetched.expect("User should exist").email,
-            format!("test1@example.com")
+            "test1@example.com"
         );
 
+        let transaction = storage.pool.begin().await.unwrap();
+        let mut adapter = SqliteTransactionAdapter { transaction };
         user_repo
-            .delete(&UserId::new("1"))
+            .delete(&mut adapter, &UserId::new("1"))
             .await
             .expect("Failed to delete user");
+        adapter.transaction.commit().await.unwrap();
         let deleted = user_repo
             .find_by_id(&UserId::new("1"))
             .await
@@ -293,10 +371,13 @@ mod tests {
 
         let mut updated_user = user.clone();
         updated_user.name = Some("Test User".to_string());
+        let transaction = storage.pool.begin().await.unwrap();
+        let mut adapter = SqliteTransactionAdapter { transaction };
         let updated_user = user_repo
-            .update(&updated_user)
+            .update(&mut adapter, &updated_user)
             .await
             .expect("Failed to update user");
+        adapter.transaction.commit().await.unwrap();
 
         // Verify updated timestamps
         assert_eq!(updated_user.created_at, user.created_at);

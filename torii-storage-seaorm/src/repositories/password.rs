@@ -64,9 +64,11 @@ impl PasswordRepository for SeaORMPasswordRepository {
 mod tests {
     use super::*;
     use crate::migrations::Migrator;
-    use crate::repositories::SeaORMUserRepository;
-    use sea_orm::Database;
+    use crate::{SeaORMTransactionAdapter, repositories::SeaORMTransaction};
+    use sea_orm::{Database, TransactionTrait};
     use sea_orm_migration::MigratorTrait;
+    use torii_core::repositories::{TransactionRepositoryView, TransactionUserRepository};
+    use torii_core::storage::NewUser;
 
     async fn setup_test_db() -> DatabaseConnection {
         let pool = Database::connect("sqlite::memory:").await.unwrap();
@@ -75,11 +77,19 @@ mod tests {
     }
 
     async fn create_test_user(pool: &DatabaseConnection) -> UserId {
-        let repo = SeaORMUserRepository::new(pool.clone());
-        let user = repo
-            .create_user("test@example.com", Some("Test User"))
+        let mut transaction = SeaORMTransactionAdapter::new(pool.begin().await.unwrap());
+        let mut view = SeaORMTransaction::new(&mut transaction).unwrap();
+        let user = view
+            .users()
+            .create(NewUser {
+                id: UserId::new_random(),
+                email: "test@example.com".to_string(),
+                name: Some("Test User".to_string()),
+                email_verified_at: None,
+            })
             .await
             .unwrap();
+        transaction.into_inner().commit().await.unwrap();
         user.id
     }
 

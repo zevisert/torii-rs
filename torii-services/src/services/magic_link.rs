@@ -1,9 +1,8 @@
-use crate::{EventBus, EventEmitter, services::UserService};
+use crate::services::UserService;
 use chrono::Duration;
 use std::sync::Arc;
 use torii_core::{
     Error, User,
-    events::Event,
     repositories::{TokenRepository, UserRepository},
     storage::{SecureToken, TokenPurpose},
 };
@@ -12,7 +11,6 @@ use torii_core::{
 pub struct MagicLinkService<U: UserRepository, T: TokenRepository> {
     user_service: Arc<UserService<U>>,
     token_repository: Arc<T>,
-    event_bus: Option<Arc<EventBus>>,
 }
 
 impl<U: UserRepository, T: TokenRepository> MagicLinkService<U, T> {
@@ -22,28 +20,26 @@ impl<U: UserRepository, T: TokenRepository> MagicLinkService<U, T> {
         Self {
             user_service,
             token_repository,
-            event_bus: None,
         }
     }
 
-    /// Enable magic-link event emission.
-    pub fn with_event_bus(mut self, event_bus: Arc<EventBus>) -> Self {
-        self.event_bus = Some(event_bus);
-        self
-    }
-
     /// Generate a magic token for a user
-    pub async fn generate_token(&self, email: &str) -> Result<SecureToken, Error> {
+    pub async fn generate_token(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        email: &str,
+    ) -> Result<SecureToken, Error> {
         // Ensure user exists (or create them) - email validation happens in UserService
-        let user = self.user_service.get_or_create_user(email).await?;
+        let user = self
+            .user_service
+            .get_or_create_user(transaction, email)
+            .await?;
 
         // Generate the token with default expiration (15 minutes)
         let expires_in = Duration::minutes(15);
         let token = self
             .token_repository
-            .create_token(&user.id, TokenPurpose::MagicLink, expires_in)
-            .await?;
-        self.emit_event(Event::MagicLinkRequested(user.id.clone()))
+            .create_token(transaction, &user.id, TokenPurpose::MagicLink, expires_in)
             .await?;
         Ok(token)
     }
@@ -51,36 +47,38 @@ impl<U: UserRepository, T: TokenRepository> MagicLinkService<U, T> {
     /// Generate a magic token with custom expiration
     pub async fn generate_token_with_expiration(
         &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
         email: &str,
         expires_in: Duration,
     ) -> Result<SecureToken, Error> {
         // Ensure user exists (or create them) - email validation happens in UserService
-        let user = self.user_service.get_or_create_user(email).await?;
+        let user = self
+            .user_service
+            .get_or_create_user(transaction, email)
+            .await?;
 
         let token = self
             .token_repository
-            .create_token(&user.id, TokenPurpose::MagicLink, expires_in)
-            .await?;
-        self.emit_event(Event::MagicLinkRequested(user.id.clone()))
+            .create_token(transaction, &user.id, TokenPurpose::MagicLink, expires_in)
             .await?;
         Ok(token)
     }
 
     /// Verify a magic token and return the associated user
-    pub async fn verify_token(&self, token: &str) -> Result<Option<User>, Error> {
+    pub async fn verify_token(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        token: &str,
+    ) -> Result<Option<User>, Error> {
         // Verify and consume the token
         let secure_token = self
             .token_repository
-            .verify_token(token, TokenPurpose::MagicLink)
+            .verify_token(transaction, token, TokenPurpose::MagicLink)
             .await?;
 
         if let Some(secure_token) = secure_token {
             // Get the user by ID
             let user = self.user_service.get_user(&secure_token.user_id).await?;
-            if let Some(user) = &user {
-                self.emit_event(Event::MagicLinkAuthenticated(user.id.clone()))
-                    .await?;
-            }
             Ok(user)
         } else {
             Ok(None)
@@ -90,13 +88,6 @@ impl<U: UserRepository, T: TokenRepository> MagicLinkService<U, T> {
     /// Clean up expired tokens
     pub async fn cleanup_expired_tokens(&self) -> Result<(), Error> {
         self.token_repository.cleanup_expired_tokens().await
-    }
-}
-
-#[async_trait::async_trait]
-impl<U: UserRepository, T: TokenRepository> EventEmitter for MagicLinkService<U, T> {
-    fn event_bus(&self) -> Option<&Arc<EventBus>> {
-        self.event_bus.as_ref()
     }
 }
 
@@ -144,7 +135,11 @@ mod tests {
 
     #[async_trait]
     impl UserRepository for MockUserRepository {
-        async fn create(&self, new_user: torii_core::storage::NewUser) -> Result<User, Error> {
+        async fn create(
+            &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
+            new_user: torii_core::storage::NewUser,
+        ) -> Result<User, Error> {
             let user = MockUser {
                 id: UserId::new_random(),
                 email: new_user.email.clone(),
@@ -186,19 +181,32 @@ mod tests {
                     .email(email.to_string())
                     .build()
                     .unwrap();
-                self.create(new_user).await
+                self.create(&mut torii_core::NoopTransactionAdapter, new_user)
+                    .await
             }
         }
 
-        async fn update(&self, _user: &User) -> Result<User, Error> {
+        async fn update(
+            &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
+            _user: &User,
+        ) -> Result<User, Error> {
             unimplemented!()
         }
 
-        async fn delete(&self, _id: &UserId) -> Result<(), Error> {
+        async fn delete(
+            &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
+            _id: &UserId,
+        ) -> Result<(), Error> {
             unimplemented!()
         }
 
-        async fn mark_email_verified(&self, _user_id: &UserId) -> Result<(), Error> {
+        async fn mark_email_verified(
+            &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
+            _user_id: &UserId,
+        ) -> Result<(), Error> {
             Ok(())
         }
     }
@@ -213,6 +221,7 @@ mod tests {
     impl TokenRepository for MockTokenRepository {
         async fn create_token(
             &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
             user_id: &UserId,
             purpose: TokenPurpose,
             expires_in: Duration,
@@ -245,6 +254,7 @@ mod tests {
 
         async fn verify_token(
             &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
             token: &str,
             purpose: TokenPurpose,
         ) -> Result<Option<SecureToken>, Error> {
@@ -303,7 +313,9 @@ mod tests {
         let token_repo = Arc::new(MockTokenRepository::default());
         let service = MagicLinkService::new(user_repo, token_repo);
 
-        let result = service.generate_token("test@example.com").await;
+        let result = service
+            .generate_token(&mut torii_core::NoopTransactionAdapter, "test@example.com")
+            .await;
         assert!(result.is_ok());
 
         let token = result.unwrap();
@@ -319,7 +331,11 @@ mod tests {
 
         let expires_in = Duration::minutes(30);
         let result = service
-            .generate_token_with_expiration("test@example.com", expires_in)
+            .generate_token_with_expiration(
+                &mut torii_core::NoopTransactionAdapter,
+                "test@example.com",
+                expires_in,
+            )
             .await;
         assert!(result.is_ok());
 
@@ -334,10 +350,18 @@ mod tests {
         let service = MagicLinkService::new(user_repo, token_repo);
 
         // First generate a token
-        let token = service.generate_token("test@example.com").await.unwrap();
+        let token = service
+            .generate_token(&mut torii_core::NoopTransactionAdapter, "test@example.com")
+            .await
+            .unwrap();
 
         // Then verify it
-        let result = service.verify_token(token.token().unwrap()).await;
+        let result = service
+            .verify_token(
+                &mut torii_core::NoopTransactionAdapter,
+                token.token().unwrap(),
+            )
+            .await;
         assert!(result.is_ok());
 
         let user = result.unwrap();
@@ -351,7 +375,9 @@ mod tests {
         let token_repo = Arc::new(MockTokenRepository::default());
         let service = MagicLinkService::new(user_repo, token_repo);
 
-        let result = service.verify_token("invalid_token").await;
+        let result = service
+            .verify_token(&mut torii_core::NoopTransactionAdapter, "invalid_token")
+            .await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
     }

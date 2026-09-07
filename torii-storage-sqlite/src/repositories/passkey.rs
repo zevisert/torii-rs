@@ -21,6 +21,7 @@ impl SqlitePasskeyRepository {
 impl PasskeyRepository for SqlitePasskeyRepository {
     async fn add_credential(
         &self,
+        _transaction: &mut dyn torii_core::TransactionAdapter,
         _user_id: &UserId,
         _credential_id: Vec<u8>,
         _public_key: Vec<u8>,
@@ -49,19 +50,31 @@ impl PasskeyRepository for SqlitePasskeyRepository {
         )))
     }
 
-    async fn update_last_used(&self, _credential_id: &[u8]) -> Result<(), Error> {
+    async fn update_last_used(
+        &self,
+        _transaction: &mut dyn torii_core::TransactionAdapter,
+        _credential_id: &[u8],
+    ) -> Result<(), Error> {
         Err(Error::Storage(StorageError::Database(
             "Passkey repository not yet implemented".to_string(),
         )))
     }
 
-    async fn delete_credential(&self, _credential_id: &[u8]) -> Result<(), Error> {
+    async fn delete_credential(
+        &self,
+        _transaction: &mut dyn torii_core::TransactionAdapter,
+        _credential_id: &[u8],
+    ) -> Result<(), Error> {
         Err(Error::Storage(StorageError::Database(
             "Passkey repository not yet implemented".to_string(),
         )))
     }
 
-    async fn delete_all_for_user(&self, _user_id: &UserId) -> Result<(), Error> {
+    async fn delete_all_for_user(
+        &self,
+        _transaction: &mut dyn torii_core::TransactionAdapter,
+        _user_id: &UserId,
+    ) -> Result<(), Error> {
         Err(Error::Storage(StorageError::Database(
             "Passkey repository not yet implemented".to_string(),
         )))

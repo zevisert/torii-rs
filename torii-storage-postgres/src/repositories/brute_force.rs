@@ -1,5 +1,6 @@
 //! PostgreSQL implementation of the brute force protection repository.
 
+use crate::PostgresTransactionAdapter;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
@@ -53,9 +54,16 @@ struct PgAttemptStats {
 impl BruteForceProtectionRepository for PostgresBruteForceRepository {
     async fn record_failed_attempt(
         &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
         email: &str,
         ip_address: Option<&str>,
     ) -> Result<FailedLoginAttempt, Error> {
+        let adapter = transaction
+            .as_any_mut()
+            .downcast_mut::<PostgresTransactionAdapter>()
+            .ok_or_else(|| {
+                StorageError::Database("PostgreSQL transaction adapter required".to_string())
+            })?;
         let row = sqlx::query_as::<_, PgFailedLoginAttempt>(
             r#"
             INSERT INTO failed_login_attempts (email, ip_address, attempted_at)
@@ -65,7 +73,7 @@ impl BruteForceProtectionRepository for PostgresBruteForceRepository {
         )
         .bind(email)
         .bind(ip_address)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *adapter.transaction)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "Failed to record failed login attempt");
@@ -104,10 +112,20 @@ impl BruteForceProtectionRepository for PostgresBruteForceRepository {
         })
     }
 
-    async fn clear_attempts(&self, email: &str) -> Result<u64, Error> {
+    async fn clear_attempts(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        email: &str,
+    ) -> Result<u64, Error> {
+        let adapter = transaction
+            .as_any_mut()
+            .downcast_mut::<PostgresTransactionAdapter>()
+            .ok_or_else(|| {
+                StorageError::Database("PostgreSQL transaction adapter required".to_string())
+            })?;
         let result = sqlx::query("DELETE FROM failed_login_attempts WHERE email = $1")
             .bind(email)
-            .execute(&self.pool)
+            .execute(&mut *adapter.transaction)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "Failed to clear attempts");
@@ -142,14 +160,21 @@ impl BruteForceProtectionRepository for PostgresBruteForceRepository {
 
     async fn set_locked_at(
         &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
         email: &str,
         locked_at: Option<DateTime<Utc>>,
     ) -> Result<(), Error> {
         // Update if user exists, ignore if not (prevents enumeration)
+        let adapter = transaction
+            .as_any_mut()
+            .downcast_mut::<PostgresTransactionAdapter>()
+            .ok_or_else(|| {
+                StorageError::Database("PostgreSQL transaction adapter required".to_string())
+            })?;
         sqlx::query("UPDATE users SET locked_at = $1 WHERE email = $2")
             .bind(locked_at)
             .bind(email)
-            .execute(&self.pool)
+            .execute(&mut *adapter.transaction)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "Failed to set locked_at");
@@ -185,7 +210,10 @@ mod tests {
         use crate::repositories::PostgresUserRepository;
         use torii_core::{repositories::UserRepository, storage::NewUser};
         let repo = PostgresUserRepository::new(storage.pool.clone());
+        let transaction = storage.pool.begin().await.unwrap();
+        let mut adapter = crate::PostgresTransactionAdapter { transaction };
         repo.create(
+            &mut adapter,
             NewUser::builder()
                 .id(UserId::new_random())
                 .email(email.to_string())
@@ -194,6 +222,71 @@ mod tests {
         )
         .await
         .expect("Failed to create test user");
+        adapter.transaction.commit().await.unwrap();
+    }
+
+    async fn record_attempt(
+        storage: &crate::PostgresStorage,
+        repo: &PostgresBruteForceRepository,
+        email: &str,
+        ip_address: Option<&str>,
+    ) -> Result<FailedLoginAttempt, Error> {
+        let transaction = storage
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let mut adapter = crate::PostgresTransactionAdapter { transaction };
+        let result = repo
+            .record_failed_attempt(&mut adapter, email, ip_address)
+            .await?;
+        adapter
+            .transaction
+            .commit()
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(result)
+    }
+
+    async fn clear_attempts(
+        storage: &crate::PostgresStorage,
+        repo: &PostgresBruteForceRepository,
+        email: &str,
+    ) -> Result<u64, Error> {
+        let transaction = storage
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let mut adapter = crate::PostgresTransactionAdapter { transaction };
+        let result = repo.clear_attempts(&mut adapter, email).await?;
+        adapter
+            .transaction
+            .commit()
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(result)
+    }
+
+    async fn set_locked_at(
+        storage: &crate::PostgresStorage,
+        repo: &PostgresBruteForceRepository,
+        email: &str,
+        locked_at: Option<chrono::DateTime<Utc>>,
+    ) -> Result<(), Error> {
+        let transaction = storage
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let mut adapter = crate::PostgresTransactionAdapter { transaction };
+        repo.set_locked_at(&mut adapter, email, locked_at).await?;
+        adapter
+            .transaction
+            .commit()
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -201,8 +294,7 @@ mod tests {
         let storage = setup_test_db().await;
         let repo = PostgresBruteForceRepository::new(storage.pool.clone());
 
-        let attempt = repo
-            .record_failed_attempt("test@example.com", Some("192.168.1.1"))
+        let attempt = record_attempt(&storage, &repo, "test@example.com", Some("192.168.1.1"))
             .await
             .expect("Failed to record attempt");
 
@@ -218,7 +310,7 @@ mod tests {
 
         // Record multiple attempts
         for _ in 0..3 {
-            repo.record_failed_attempt("test@example.com", None)
+            record_attempt(&storage, &repo, "test@example.com", None)
                 .await
                 .expect("Failed to record attempt");
         }
@@ -238,7 +330,7 @@ mod tests {
         let repo = PostgresBruteForceRepository::new(storage.pool.clone());
 
         // Record an attempt
-        repo.record_failed_attempt("test@example.com", None)
+        record_attempt(&storage, &repo, "test@example.com", None)
             .await
             .expect("Failed to record attempt");
 
@@ -259,16 +351,18 @@ mod tests {
 
         // Record attempts for two emails
         for _ in 0..3 {
-            repo.record_failed_attempt("test1@example.com", None)
+            record_attempt(&storage, &repo, "test1@example.com", None)
                 .await
                 .unwrap();
-            repo.record_failed_attempt("test2@example.com", None)
+            record_attempt(&storage, &repo, "test2@example.com", None)
                 .await
                 .unwrap();
         }
 
         // Clear attempts for one email
-        let cleared = repo.clear_attempts("test1@example.com").await.unwrap();
+        let cleared = clear_attempts(&storage, &repo, "test1@example.com")
+            .await
+            .unwrap();
         assert_eq!(cleared, 3);
 
         // Verify test1 has no attempts
@@ -298,7 +392,7 @@ mod tests {
 
         // Set locked_at
         let now = Utc::now();
-        repo.set_locked_at("test@example.com", Some(now))
+        set_locked_at(&storage, &repo, "test@example.com", Some(now))
             .await
             .unwrap();
 
@@ -307,7 +401,9 @@ mod tests {
         assert!(locked_at.is_some());
 
         // Clear locked_at
-        repo.set_locked_at("test@example.com", None).await.unwrap();
+        set_locked_at(&storage, &repo, "test@example.com", None)
+            .await
+            .unwrap();
 
         // Should be None again
         let locked_at = repo.get_locked_at("test@example.com").await.unwrap();
@@ -320,10 +416,13 @@ mod tests {
         let repo = PostgresBruteForceRepository::new(storage.pool.clone());
 
         // Should not error for non-existent user
+        let transaction = storage.pool.begin().await.unwrap();
+        let mut adapter = crate::PostgresTransactionAdapter { transaction };
         let result = repo
-            .set_locked_at("nonexistent@example.com", Some(Utc::now()))
+            .set_locked_at(&mut adapter, "nonexistent@example.com", Some(Utc::now()))
             .await;
         assert!(result.is_ok());
+        adapter.transaction.commit().await.unwrap();
     }
 
     #[tokio::test]
@@ -334,15 +433,15 @@ mod tests {
         let repo = PostgresBruteForceRepository::new(storage.pool.clone());
 
         // Record old attempts for both users
-        repo.record_failed_attempt("locked@example.com", None)
+        record_attempt(&storage, &repo, "locked@example.com", None)
             .await
             .unwrap();
-        repo.record_failed_attempt("unlocked@example.com", None)
+        record_attempt(&storage, &repo, "unlocked@example.com", None)
             .await
             .unwrap();
 
         // Lock one user
-        repo.set_locked_at("locked@example.com", Some(Utc::now()))
+        set_locked_at(&storage, &repo, "locked@example.com", Some(Utc::now()))
             .await
             .unwrap();
 

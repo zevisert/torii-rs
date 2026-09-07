@@ -6,9 +6,23 @@ use sea_orm::{
 };
 use torii_core::{Error, OAuthAccount, User, UserId, repositories::OAuthRepository};
 
-use crate::SeaORMStorageError;
 use crate::entities::{oauth, pkce_verifier, user};
+use crate::{SeaORMStorageError, SeaORMTransactionAdapter};
 use torii_core::error::StorageError;
+
+fn seaorm_transaction(
+    value: &mut dyn torii_core::TransactionAdapter,
+) -> Result<&sea_orm::DatabaseTransaction, Error> {
+    value
+        .as_any_mut()
+        .downcast_mut::<SeaORMTransactionAdapter>()
+        .map(|adapter| adapter.transaction())
+        .ok_or_else(|| {
+            Error::Storage(StorageError::Database(
+                "SeaORM transaction adapter required".into(),
+            ))
+        })
+}
 
 pub struct SeaORMOAuthRepository {
     pool: DatabaseConnection,
@@ -24,12 +38,13 @@ impl SeaORMOAuthRepository {
 impl OAuthRepository for SeaORMOAuthRepository {
     async fn create_account(
         &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
         provider: &str,
         subject: &str,
         user_id: &UserId,
     ) -> Result<OAuthAccount, Error> {
         let user = user::Entity::find_by_id(user_id.to_string())
-            .one(&self.pool)
+            .one(seaorm_transaction(transaction)?)
             .await
             .map_err(SeaORMStorageError::Database)?;
 
@@ -41,7 +56,7 @@ impl OAuthRepository for SeaORMOAuthRepository {
                 ..Default::default()
             };
             let oauth_account = oauth_account
-                .insert(&self.pool)
+                .insert(seaorm_transaction(transaction)?)
                 .await
                 .map_err(SeaORMStorageError::Database)?;
 
@@ -111,12 +126,14 @@ impl OAuthRepository for SeaORMOAuthRepository {
 
     async fn link_account(
         &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
         user_id: &UserId,
         provider: &str,
         subject: &str,
     ) -> Result<(), Error> {
+        let connection = seaorm_transaction(transaction)?;
         let user = user::Entity::find_by_id(user_id.to_string())
-            .one(&self.pool)
+            .one(connection)
             .await
             .map_err(SeaORMStorageError::Database)?;
 
@@ -132,7 +149,7 @@ impl OAuthRepository for SeaORMOAuthRepository {
             ..Default::default()
         };
         oauth_account
-            .insert(&self.pool)
+            .insert(connection)
             .await
             .map_err(SeaORMStorageError::Database)?;
         Ok(())
@@ -140,6 +157,7 @@ impl OAuthRepository for SeaORMOAuthRepository {
 
     async fn store_pkce_verifier(
         &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
         csrf_state: &str,
         pkce_verifier: &str,
         expires_in: Duration,
@@ -151,7 +169,7 @@ impl OAuthRepository for SeaORMOAuthRepository {
             ..Default::default()
         };
         pkce_verifier
-            .insert(&self.pool)
+            .insert(seaorm_transaction(transaction)?)
             .await
             .map_err(SeaORMStorageError::Database)?;
         Ok(())
@@ -172,10 +190,14 @@ impl OAuthRepository for SeaORMOAuthRepository {
         }
     }
 
-    async fn delete_pkce_verifier(&self, csrf_state: &str) -> Result<(), Error> {
+    async fn delete_pkce_verifier(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        csrf_state: &str,
+    ) -> Result<(), Error> {
         pkce_verifier::Entity::delete_many()
             .filter(pkce_verifier::Column::CsrfState.eq(csrf_state))
-            .exec(&self.pool)
+            .exec(seaorm_transaction(transaction)?)
             .await
             .map_err(SeaORMStorageError::Database)?;
         Ok(())
@@ -205,11 +227,16 @@ impl OAuthRepository for SeaORMOAuthRepository {
         Ok(accounts)
     }
 
-    async fn unlink_account(&self, user_id: &UserId, provider: &str) -> Result<(), Error> {
+    async fn unlink_account(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        user_id: &UserId,
+        provider: &str,
+    ) -> Result<(), Error> {
         oauth::Entity::delete_many()
             .filter(oauth::Column::UserId.eq(user_id.as_str()))
             .filter(oauth::Column::Provider.eq(provider))
-            .exec(&self.pool)
+            .exec(seaorm_transaction(transaction)?)
             .await
             .map_err(SeaORMStorageError::Database)?;
 
@@ -221,9 +248,11 @@ impl OAuthRepository for SeaORMOAuthRepository {
 mod tests {
     use super::*;
     use crate::migrations::Migrator;
-    use crate::repositories::SeaORMUserRepository;
-    use sea_orm::Database;
+    use crate::{SeaORMTransactionAdapter, repositories::SeaORMTransaction};
+    use sea_orm::{Database, TransactionTrait};
     use sea_orm_migration::MigratorTrait;
+    use torii_core::repositories::{TransactionRepositoryView, TransactionUserRepository};
+    use torii_core::storage::NewUser;
 
     async fn setup_test_db() -> DatabaseConnection {
         let pool = Database::connect("sqlite::memory:").await.unwrap();
@@ -231,12 +260,24 @@ mod tests {
         pool
     }
 
+    async fn begin_transaction(pool: &DatabaseConnection) -> SeaORMTransactionAdapter {
+        SeaORMTransactionAdapter::new(pool.begin().await.unwrap())
+    }
+
     async fn create_test_user(pool: &DatabaseConnection) -> UserId {
-        let repo = SeaORMUserRepository::new(pool.clone());
-        let user = repo
-            .create_user("test@example.com", Some("Test User"))
+        let mut transaction = begin_transaction(pool).await;
+        let mut view = SeaORMTransaction::new(&mut transaction).unwrap();
+        let user = view
+            .users()
+            .create(NewUser {
+                id: UserId::new_random(),
+                email: "test@example.com".to_string(),
+                name: Some("Test User".to_string()),
+                email_verified_at: None,
+            })
             .await
             .unwrap();
+        transaction.into_inner().commit().await.unwrap();
         user.id
     }
 
@@ -246,10 +287,12 @@ mod tests {
         let repo = SeaORMOAuthRepository::new(pool.clone());
         let user_id = create_test_user(&pool).await;
 
+        let mut transaction = begin_transaction(&pool).await;
         let account = repo
-            .create_account("google", "12345", &user_id)
+            .create_account(&mut transaction, "google", "12345", &user_id)
             .await
             .unwrap();
+        transaction.into_inner().commit().await.unwrap();
 
         assert_eq!(account.provider, "google");
         assert_eq!(account.subject, "12345");
@@ -262,10 +305,12 @@ mod tests {
         let repo = SeaORMOAuthRepository::new(pool.clone());
         let user_id = create_test_user(&pool).await;
 
+        let mut transaction = begin_transaction(&pool).await;
         let _account = repo
-            .create_account("google", "12345", &user_id)
+            .create_account(&mut transaction, "google", "12345", &user_id)
             .await
             .unwrap();
+        transaction.into_inner().commit().await.unwrap();
 
         let found_user = repo.find_user_by_provider("google", "12345").await.unwrap();
 
@@ -276,7 +321,7 @@ mod tests {
     #[tokio::test]
     async fn test_find_user_by_provider_not_found() {
         let pool = setup_test_db().await;
-        let repo = SeaORMOAuthRepository::new(pool);
+        let repo = SeaORMOAuthRepository::new(pool.clone());
 
         let result = repo
             .find_user_by_provider("google", "nonexistent")
@@ -292,10 +337,12 @@ mod tests {
         let repo = SeaORMOAuthRepository::new(pool.clone());
         let user_id = create_test_user(&pool).await;
 
+        let mut transaction = begin_transaction(&pool).await;
         let _account = repo
-            .create_account("github", "67890", &user_id)
+            .create_account(&mut transaction, "github", "67890", &user_id)
             .await
             .unwrap();
+        transaction.into_inner().commit().await.unwrap();
 
         let found_account = repo
             .find_account_by_provider("github", "67890")
@@ -328,7 +375,11 @@ mod tests {
         let repo = SeaORMOAuthRepository::new(pool.clone());
         let user_id = create_test_user(&pool).await;
 
-        let result = repo.link_account(&user_id, "discord", "54321").await;
+        let mut transaction = begin_transaction(&pool).await;
+        let result = repo
+            .link_account(&mut transaction, &user_id, "discord", "54321")
+            .await;
+        transaction.into_inner().commit().await.unwrap();
 
         assert!(result.is_ok());
 
@@ -343,15 +394,17 @@ mod tests {
     #[tokio::test]
     async fn test_store_and_get_pkce_verifier() {
         let pool = setup_test_db().await;
-        let repo = SeaORMOAuthRepository::new(pool);
+        let repo = SeaORMOAuthRepository::new(pool.clone());
 
         let csrf_state = "test-csrf-state";
         let pkce_verifier = "test-pkce-verifier";
         let expires_in = Duration::hours(1);
 
+        let mut transaction = begin_transaction(&pool).await;
         let result = repo
-            .store_pkce_verifier(csrf_state, pkce_verifier, expires_in)
+            .store_pkce_verifier(&mut transaction, csrf_state, pkce_verifier, expires_in)
             .await;
+        transaction.into_inner().commit().await.unwrap();
         assert!(result.is_ok());
 
         let retrieved_verifier = repo.get_pkce_verifier(csrf_state).await.unwrap();
@@ -378,16 +431,22 @@ mod tests {
         let expires_in = Duration::hours(1);
 
         // Store it first
-        repo.store_pkce_verifier(csrf_state, pkce_verifier, expires_in)
+        let mut transaction = begin_transaction(&pool).await;
+        repo.store_pkce_verifier(&mut transaction, csrf_state, pkce_verifier, expires_in)
             .await
             .unwrap();
+        transaction.into_inner().commit().await.unwrap();
 
         // Verify it exists
         let retrieved = repo.get_pkce_verifier(csrf_state).await.unwrap();
         assert!(retrieved.is_some());
 
         // Delete it
-        let result = repo.delete_pkce_verifier(csrf_state).await;
+        let mut transaction = begin_transaction(&pool).await;
+        let result = repo
+            .delete_pkce_verifier(&mut transaction, csrf_state)
+            .await;
+        transaction.into_inner().commit().await.unwrap();
         assert!(result.is_ok());
 
         // Verify it's gone

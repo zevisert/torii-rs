@@ -18,7 +18,11 @@ impl SqliteUserRepository {
 
 #[async_trait]
 impl UserRepository for SqliteUserRepository {
-    async fn create(&self, user: NewUser) -> Result<User, Error> {
+    async fn create(
+        &self,
+        _transaction: &mut dyn torii_core::TransactionAdapter,
+        user: NewUser,
+    ) -> Result<User, Error> {
         let now = chrono::Utc::now().timestamp();
         let email_verified_timestamp = user.email_verified_at.map(|dt| dt.timestamp());
 
@@ -67,11 +71,20 @@ impl UserRepository for SqliteUserRepository {
             Ok(user)
         } else {
             let new_user = NewUser::new(email.to_string());
-            self.create(new_user).await
+            <Self as UserRepository>::create(
+                self,
+                &mut torii_core::NoopTransactionAdapter,
+                new_user,
+            )
+            .await
         }
     }
 
-    async fn update(&self, user: &User) -> Result<User, Error> {
+    async fn update(
+        &self,
+        _transaction: &mut dyn torii_core::TransactionAdapter,
+        user: &User,
+    ) -> Result<User, Error> {
         let now = chrono::Utc::now().timestamp();
         let email_verified_timestamp = user.email_verified_at.map(|dt| dt.timestamp());
 
@@ -95,7 +108,11 @@ impl UserRepository for SqliteUserRepository {
         Ok(sqlite_user.into())
     }
 
-    async fn delete(&self, id: &UserId) -> Result<(), Error> {
+    async fn delete(
+        &self,
+        _transaction: &mut dyn torii_core::TransactionAdapter,
+        id: &UserId,
+    ) -> Result<(), Error> {
         sqlx::query("DELETE FROM users WHERE id = ?1")
             .bind(id.as_str())
             .execute(&self.pool)
@@ -105,7 +122,11 @@ impl UserRepository for SqliteUserRepository {
         Ok(())
     }
 
-    async fn mark_email_verified(&self, user_id: &UserId) -> Result<(), Error> {
+    async fn mark_email_verified(
+        &self,
+        _transaction: &mut dyn torii_core::TransactionAdapter,
+        user_id: &UserId,
+    ) -> Result<(), Error> {
         let now = chrono::Utc::now().timestamp();
 
         sqlx::query("UPDATE users SET email_verified_at = ?1, updated_at = ?2 WHERE id = ?3")

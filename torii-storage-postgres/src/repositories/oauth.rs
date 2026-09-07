@@ -7,8 +7,22 @@ use torii_core::{
     Error, OAuthAccount, User, UserId, error::StorageError, repositories::OAuthRepository,
 };
 
-use crate::PostgresUser;
 use crate::oauth::PostgresOAuthAccount;
+use crate::{PostgresTransactionAdapter, PostgresUser};
+
+fn pg_connection(
+    value: &mut dyn torii_core::TransactionAdapter,
+) -> Result<&mut sqlx::PgConnection, Error> {
+    value
+        .as_any_mut()
+        .downcast_mut::<PostgresTransactionAdapter>()
+        .map(|adapter| &mut *adapter.transaction)
+        .ok_or_else(|| {
+            Error::Storage(StorageError::Database(
+                "PostgreSQL transaction adapter required".into(),
+            ))
+        })
+}
 
 /// PostgreSQL repository for OAuth data.
 pub struct PostgresOAuthRepository {
@@ -26,6 +40,7 @@ impl PostgresOAuthRepository {
 impl OAuthRepository for PostgresOAuthRepository {
     async fn create_account(
         &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
         provider: &str,
         subject: &str,
         user_id: &UserId,
@@ -43,7 +58,7 @@ impl OAuthRepository for PostgresOAuthRepository {
         .bind(subject)
         .bind(now)
         .bind(now)
-        .fetch_one(&self.pool)
+        .fetch_one(pg_connection(transaction)?)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "Failed to create OAuth account");
@@ -110,6 +125,7 @@ impl OAuthRepository for PostgresOAuthRepository {
 
     async fn link_account(
         &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
         user_id: &UserId,
         provider: &str,
         subject: &str,
@@ -127,7 +143,7 @@ impl OAuthRepository for PostgresOAuthRepository {
         .bind(subject)
         .bind(now)
         .bind(now)
-        .execute(&self.pool)
+        .execute(pg_connection(transaction)?)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "Failed to link OAuth account");
@@ -141,6 +157,7 @@ impl OAuthRepository for PostgresOAuthRepository {
 
     async fn store_pkce_verifier(
         &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
         csrf_state: &str,
         pkce_verifier: &str,
         expires_in: Duration,
@@ -159,7 +176,7 @@ impl OAuthRepository for PostgresOAuthRepository {
         .bind(expires_at)
         .bind(now)
         .bind(now)
-        .execute(&self.pool)
+        .execute(pg_connection(transaction)?)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "Failed to store PKCE verifier");
@@ -193,10 +210,14 @@ impl OAuthRepository for PostgresOAuthRepository {
         Ok(verifier)
     }
 
-    async fn delete_pkce_verifier(&self, csrf_state: &str) -> Result<(), Error> {
+    async fn delete_pkce_verifier(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        csrf_state: &str,
+    ) -> Result<(), Error> {
         sqlx::query("DELETE FROM oauth_state WHERE csrf_state = $1")
             .bind(csrf_state)
-            .execute(&self.pool)
+            .execute(pg_connection(transaction)?)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "Failed to delete PKCE verifier");
@@ -230,7 +251,12 @@ impl OAuthRepository for PostgresOAuthRepository {
         Ok(accounts.into_iter().map(|a| a.into()).collect())
     }
 
-    async fn unlink_account(&self, user_id: &UserId, provider: &str) -> Result<(), Error> {
+    async fn unlink_account(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        user_id: &UserId,
+        provider: &str,
+    ) -> Result<(), Error> {
         sqlx::query(
             r#"
             DELETE FROM oauth_accounts
@@ -239,7 +265,7 @@ impl OAuthRepository for PostgresOAuthRepository {
         )
         .bind(user_id.as_str())
         .bind(provider)
-        .execute(&self.pool)
+        .execute(pg_connection(transaction)?)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "Failed to unlink OAuth account");

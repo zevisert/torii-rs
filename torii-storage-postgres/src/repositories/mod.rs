@@ -65,6 +65,17 @@ impl PostgresRepositoryProvider {
             brute_force,
         }
     }
+
+    pub fn database_pool(&self) -> PgPool {
+        self.pool.clone()
+    }
+
+    pub fn user_repository(&self) -> Arc<PostgresUserRepository> {
+        self.user.clone()
+    }
+    pub fn password_repository(&self) -> Arc<PostgresPasswordRepository> {
+        self.password.clone()
+    }
 }
 
 // Implement individual provider traits

@@ -36,14 +36,14 @@ impl PostgresTokenRepository {
 }
 
 #[derive(Debug, sqlx::FromRow)]
-struct SecureTokenRow {
-    user_id: String,
-    token: String, // This is the hash, not plaintext
-    purpose: String,
-    used_at: Option<DateTime<Utc>>,
-    expires_at: DateTime<Utc>,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
+pub(crate) struct SecureTokenRow {
+    pub(crate) user_id: String,
+    pub(crate) token: String, // This is the hash, not plaintext
+    pub(crate) purpose: String,
+    pub(crate) used_at: Option<DateTime<Utc>>,
+    pub(crate) expires_at: DateTime<Utc>,
+    pub(crate) created_at: DateTime<Utc>,
+    pub(crate) updated_at: DateTime<Utc>,
 }
 
 impl PostgresTokenRepository {
@@ -77,6 +77,7 @@ impl PostgresTokenRepository {
 impl TokenRepository for PostgresTokenRepository {
     async fn create_token(
         &self,
+        _transaction: &mut dyn torii_core::TransactionAdapter,
         user_id: &UserId,
         purpose: TokenPurpose,
         expires_in: Duration,
@@ -125,6 +126,7 @@ impl TokenRepository for PostgresTokenRepository {
 
     async fn verify_token(
         &self,
+        _transaction: &mut dyn torii_core::TransactionAdapter,
         token: &str,
         purpose: TokenPurpose,
     ) -> Result<Option<SecureToken>, Error> {

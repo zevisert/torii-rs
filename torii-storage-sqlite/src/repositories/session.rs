@@ -1,3 +1,4 @@
+use crate::SqliteTransactionAdapter;
 use async_trait::async_trait;
 use chrono::Duration;
 use sqlx::SqlitePool;
@@ -29,7 +30,15 @@ struct SqliteSession {
 
 #[async_trait]
 impl SessionRepository for SqliteSessionRepository {
-    async fn create(&self, session: Session) -> Result<Session, Error> {
+    async fn create(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        session: Session,
+    ) -> Result<Session, Error> {
+        let adapter = transaction
+            .as_any_mut()
+            .downcast_mut::<SqliteTransactionAdapter>()
+            .ok_or_else(|| StorageError::Database("SQLite transaction adapter required".into()))?;
         // Store the hash, not the plaintext token
         sqlx::query(
             r#"
@@ -44,7 +53,7 @@ impl SessionRepository for SqliteSessionRepository {
         .bind(session.created_at.timestamp())
         .bind(session.updated_at.timestamp())
         .bind(session.expires_at.timestamp())
-        .execute(&self.pool)
+        .execute(&mut *adapter.transaction)
         .await
         .map_err(|e| Error::Storage(StorageError::Database(e.to_string())))?;
 
@@ -89,22 +98,41 @@ impl SessionRepository for SqliteSessionRepository {
         }
     }
 
-    async fn delete(&self, token: &SessionToken) -> Result<(), Error> {
+    async fn delete(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        token: &SessionToken,
+    ) -> Result<(), Error> {
         let token_hash = token.token_hash();
-
-        sqlx::query("DELETE FROM sessions WHERE token = ?1")
-            .bind(&token_hash)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| Error::Storage(StorageError::Database(e.to_string())))?;
+        let query = sqlx::query("DELETE FROM sessions WHERE token = ?1").bind(&token_hash);
+        if transaction.backend() == "unmanaged" {
+            query.execute(&self.pool).await
+        } else {
+            let adapter = transaction
+                .as_any_mut()
+                .downcast_mut::<SqliteTransactionAdapter>()
+                .ok_or_else(|| {
+                    StorageError::Database("SQLite transaction adapter required".into())
+                })?;
+            query.execute(&mut *adapter.transaction).await
+        }
+        .map_err(|e| Error::Storage(StorageError::Database(e.to_string())))?;
 
         Ok(())
     }
 
-    async fn delete_by_user_id(&self, user_id: &UserId) -> Result<(), Error> {
+    async fn delete_by_user_id(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        user_id: &UserId,
+    ) -> Result<(), Error> {
+        let adapter = transaction
+            .as_any_mut()
+            .downcast_mut::<SqliteTransactionAdapter>()
+            .ok_or_else(|| StorageError::Database("SQLite transaction adapter required".into()))?;
         sqlx::query("DELETE FROM sessions WHERE user_id = ?1")
             .bind(user_id.as_str())
-            .execute(&self.pool)
+            .execute(&mut *adapter.transaction)
             .await
             .map_err(|e| Error::Storage(StorageError::Database(e.to_string())))?;
 
@@ -150,7 +178,16 @@ impl SessionRepository for SqliteSessionRepository {
             .collect())
     }
 
-    async fn refresh(&self, token: &SessionToken, duration: Duration) -> Result<Session, Error> {
+    async fn refresh(
+        &self,
+        transaction: &mut dyn torii_core::TransactionAdapter,
+        token: &SessionToken,
+        duration: Duration,
+    ) -> Result<Session, Error> {
+        let adapter = transaction
+            .as_any_mut()
+            .downcast_mut::<SqliteTransactionAdapter>()
+            .ok_or_else(|| StorageError::Database("SQLite transaction adapter required".into()))?;
         let token_hash = token.token_hash();
         let now = chrono::Utc::now();
         let new_expires_at = now + duration;
@@ -159,7 +196,7 @@ impl SessionRepository for SqliteSessionRepository {
             .bind(new_expires_at.timestamp())
             .bind(now.timestamp())
             .bind(&token_hash)
-            .execute(&self.pool)
+            .execute(&mut *adapter.transaction)
             .await
             .map_err(|e| Error::Storage(StorageError::Database(e.to_string())))?;
 

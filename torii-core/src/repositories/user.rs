@@ -1,11 +1,15 @@
-use crate::{Error, User, UserId, storage::NewUser};
+use crate::{Error, User, UserId, storage::NewUser, transaction::TransactionAdapter};
 use async_trait::async_trait;
 
 /// Repository for user data access
 #[async_trait]
 pub trait UserRepository: Send + Sync + 'static {
     /// Create a new user
-    async fn create(&self, user: NewUser) -> Result<User, Error>;
+    async fn create(
+        &self,
+        transaction: &mut dyn TransactionAdapter,
+        user: NewUser,
+    ) -> Result<User, Error>;
 
     /// Find a user by ID
     async fn find_by_id(&self, id: &UserId) -> Result<Option<User>, Error>;
@@ -17,11 +21,23 @@ pub trait UserRepository: Send + Sync + 'static {
     async fn find_or_create_by_email(&self, email: &str) -> Result<User, Error>;
 
     /// Update an existing user
-    async fn update(&self, user: &User) -> Result<User, Error>;
+    async fn update(
+        &self,
+        transaction: &mut dyn TransactionAdapter,
+        user: &User,
+    ) -> Result<User, Error>;
 
     /// Delete a user by ID
-    async fn delete(&self, id: &UserId) -> Result<(), Error>;
+    async fn delete(
+        &self,
+        transaction: &mut dyn TransactionAdapter,
+        id: &UserId,
+    ) -> Result<(), Error>;
 
     /// Mark a user's email as verified
-    async fn mark_email_verified(&self, user_id: &UserId) -> Result<(), Error>;
+    async fn mark_email_verified(
+        &self,
+        transaction: &mut dyn TransactionAdapter,
+        user_id: &UserId,
+    ) -> Result<(), Error>;
 }

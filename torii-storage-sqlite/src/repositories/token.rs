@@ -4,6 +4,7 @@ use torii_core::{
     Error, UserId,
     repositories::TokenRepository,
     storage::{SecureToken, TokenPurpose},
+    transaction::TransactionAdapter,
 };
 
 /// Stub SQLite implementation of TokenRepository
@@ -20,6 +21,7 @@ impl SqliteTokenRepository {
 impl TokenRepository for SqliteTokenRepository {
     async fn create_token(
         &self,
+        _transaction: &mut dyn TransactionAdapter,
         _user_id: &UserId,
         _purpose: TokenPurpose,
         _expires_in: Duration,
@@ -31,6 +33,7 @@ impl TokenRepository for SqliteTokenRepository {
 
     async fn verify_token(
         &self,
+        _transaction: &mut dyn TransactionAdapter,
         _token: &str,
         _purpose: TokenPurpose,
     ) -> Result<Option<SecureToken>, Error> {

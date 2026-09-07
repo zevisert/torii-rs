@@ -6,6 +6,16 @@ pub(crate) mod test {
     use crate::repositories::SqliteSessionRepository;
     use crate::tests::{create_test_user, setup_sqlite_storage};
     use chrono::Utc;
+
+    async fn delete_session(storage: &SqliteStorage, token: &SessionToken) {
+        let transaction = storage.pool.begin().await.unwrap();
+        let mut adapter = crate::SqliteTransactionAdapter { transaction };
+        SqliteSessionRepository::new(storage.pool.clone())
+            .delete(&mut adapter, token)
+            .await
+            .unwrap();
+        adapter.transaction.commit().await.unwrap();
+    }
     use std::time::Duration;
     use torii_core::{Session, UserId, repositories::SessionRepository, session::SessionToken};
 
@@ -16,9 +26,14 @@ pub(crate) mod test {
         expires_in: Duration,
     ) -> Result<Session, torii_core::Error> {
         let session_repo = SqliteSessionRepository::new(storage.pool.clone());
+        let transaction = storage.pool.begin().await.map_err(|error| {
+            torii_core::Error::Storage(torii_core::error::StorageError::Database(error.to_string()))
+        })?;
+        let mut adapter = crate::SqliteTransactionAdapter { transaction };
         let now = Utc::now();
-        session_repo
+        let session = session_repo
             .create(
+                &mut adapter,
                 Session::builder()
                     .token(token.clone())
                     .user_id(UserId::new(user_id))
@@ -30,7 +45,11 @@ pub(crate) mod test {
                     .build()
                     .expect("Failed to build session"),
             )
-            .await
+            .await?;
+        adapter.transaction.commit().await.map_err(|error| {
+            torii_core::Error::Storage(torii_core::error::StorageError::Database(error.to_string()))
+        })?;
+        Ok(session)
     }
 
     #[tokio::test]
@@ -55,10 +74,7 @@ pub(crate) mod test {
         assert!(fetched.is_some());
         assert_eq!(fetched.unwrap().user_id, UserId::new("1"));
 
-        session_repo
-            .delete(&token)
-            .await
-            .expect("Failed to delete session");
+        delete_session(&storage, &token).await;
         let deleted = session_repo
             .find_by_token(&token)
             .await
@@ -85,10 +101,13 @@ pub(crate) mod test {
             .build()
             .unwrap();
 
+        let transaction = storage.pool.begin().await.unwrap();
+        let mut adapter = crate::SqliteTransactionAdapter { transaction };
         session_repo
-            .create(expired_session)
+            .create(&mut adapter, expired_session)
             .await
             .expect("Failed to create expired session");
+        adapter.transaction.commit().await.unwrap();
 
         // Create valid session
         let valid_token = SessionToken::new_random();
@@ -150,10 +169,13 @@ pub(crate) mod test {
             .expect("Failed to create session 3");
 
         // Delete all sessions for user 1
+        let transaction = storage.pool.begin().await.unwrap();
+        let mut adapter = crate::SqliteTransactionAdapter { transaction };
         session_repo
-            .delete_by_user_id(&UserId::new("1"))
+            .delete_by_user_id(&mut adapter, &UserId::new("1"))
             .await
             .expect("Failed to delete sessions for user");
+        adapter.transaction.commit().await.unwrap();
 
         // Verify user 1's sessions are deleted
         let session1 = session_repo

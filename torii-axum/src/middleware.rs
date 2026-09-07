@@ -7,7 +7,7 @@ use axum::{
 };
 use axum_extra::extract::CookieJar;
 use torii::{SessionToken, Torii, User};
-use torii_core::RepositoryProvider;
+use torii_core::{RepositoryProvider, repositories::TransactionalRepositoryProvider};
 
 use crate::error::AuthError;
 
@@ -41,6 +41,7 @@ use crate::error::AuthError;
 pub trait HasTorii<R>
 where
     R: RepositoryProvider,
+    R: TransactionalRepositoryProvider,
 {
     /// Returns a reference to the Torii instance.
     fn torii(&self) -> &Torii<R>;
@@ -50,6 +51,7 @@ where
 impl<R> HasTorii<R> for Arc<Torii<R>>
 where
     R: RepositoryProvider,
+    R: TransactionalRepositoryProvider,
 {
     fn torii(&self) -> &Torii<R> {
         self
@@ -65,6 +67,7 @@ pub async fn auth_middleware<S, R>(
 where
     S: HasTorii<R>,
     R: RepositoryProvider,
+    R: TransactionalRepositoryProvider,
 {
     request.extensions_mut().insert(None::<User>);
 
@@ -118,6 +121,7 @@ pub async fn require_auth<S, R>(
 where
     S: HasTorii<R>,
     R: RepositoryProvider,
+    R: TransactionalRepositoryProvider,
 {
     // Try Bearer token first, then fall back to cookie
     let session_token = if let Some(token) = extract_bearer_token(&request) {

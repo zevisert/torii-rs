@@ -106,12 +106,13 @@ pub struct BruteForceProtectionConfig {
     /// the account becomes locked.
     pub max_failed_attempts: u32,
 
-    /// Lockout duration and counting window.
+    /// Failed-attempt counting window.
     ///
     /// Failed attempts within this window count toward the lockout threshold.
-    /// Once locked, the account remains locked for this duration from the
-    /// last failed attempt.
     pub lockout_period: Duration,
+
+    /// How long an account remains locked after reaching the threshold.
+    pub lockout_duration: Duration,
 
     /// How long to retain attempt records for audit purposes.
     ///
@@ -126,6 +127,7 @@ impl Default for BruteForceProtectionConfig {
             enabled: true,
             max_failed_attempts: 5,
             lockout_period: Duration::minutes(15),
+            lockout_duration: Duration::minutes(15),
             retention_period: Duration::days(7),
         }
     }

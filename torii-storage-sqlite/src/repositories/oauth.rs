@@ -20,6 +20,7 @@ impl SqliteOAuthRepository {
 impl OAuthRepository for SqliteOAuthRepository {
     async fn create_account(
         &self,
+        _transaction: &mut dyn torii_core::TransactionAdapter,
         _provider: &str,
         _subject: &str,
         _user_id: &UserId,
@@ -51,6 +52,7 @@ impl OAuthRepository for SqliteOAuthRepository {
 
     async fn link_account(
         &self,
+        _transaction: &mut dyn torii_core::TransactionAdapter,
         _user_id: &UserId,
         _provider: &str,
         _subject: &str,
@@ -62,6 +64,7 @@ impl OAuthRepository for SqliteOAuthRepository {
 
     async fn store_pkce_verifier(
         &self,
+        _transaction: &mut dyn torii_core::TransactionAdapter,
         _csrf_state: &str,
         _pkce_verifier: &str,
         _expires_in: Duration,
@@ -77,7 +80,11 @@ impl OAuthRepository for SqliteOAuthRepository {
         )))
     }
 
-    async fn delete_pkce_verifier(&self, _csrf_state: &str) -> Result<(), Error> {
+    async fn delete_pkce_verifier(
+        &self,
+        _transaction: &mut dyn torii_core::TransactionAdapter,
+        _csrf_state: &str,
+    ) -> Result<(), Error> {
         Err(Error::Storage(StorageError::Database(
             "OAuth repository not yet implemented".to_string(),
         )))
@@ -92,7 +99,12 @@ impl OAuthRepository for SqliteOAuthRepository {
         )))
     }
 
-    async fn unlink_account(&self, _user_id: &UserId, _provider: &str) -> Result<(), Error> {
+    async fn unlink_account(
+        &self,
+        _transaction: &mut dyn torii_core::TransactionAdapter,
+        _user_id: &UserId,
+        _provider: &str,
+    ) -> Result<(), Error> {
         Err(Error::Storage(StorageError::Database(
             "OAuth repository not yet implemented".to_string(),
         )))

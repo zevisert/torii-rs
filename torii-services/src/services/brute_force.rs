@@ -38,13 +38,10 @@ use std::sync::Arc;
 use chrono::Utc;
 
 use torii_core::{
-    Error,
-    events::{Event, UnlockReason},
+    Error, TransactionAdapter,
     repositories::BruteForceProtectionRepository,
     storage::{AttemptStats, BruteForceProtectionConfig, LockoutStatus},
 };
-
-use crate::{EventBus, EventEmitter};
 
 /// Service for managing brute force protection.
 ///
@@ -59,7 +56,6 @@ use crate::{EventBus, EventEmitter};
 pub struct BruteForceProtectionService<R: BruteForceProtectionRepository> {
     repository: Arc<R>,
     config: BruteForceProtectionConfig,
-    event_bus: Option<Arc<EventBus>>,
 }
 
 impl<R: BruteForceProtectionRepository> BruteForceProtectionService<R> {
@@ -70,17 +66,7 @@ impl<R: BruteForceProtectionRepository> BruteForceProtectionService<R> {
     /// * `repository` - The repository implementation for storing attempt data
     /// * `config` - Configuration for lockout behavior
     pub fn new(repository: Arc<R>, config: BruteForceProtectionConfig) -> Self {
-        Self {
-            repository,
-            config,
-            event_bus: None,
-        }
-    }
-
-    /// Enable security event emission for this service.
-    pub fn with_event_bus(mut self, event_bus: Arc<EventBus>) -> Self {
-        self.event_bus = Some(event_bus);
-        self
+        Self { repository, config }
     }
 
     /// Get the current configuration.
@@ -122,7 +108,7 @@ impl<R: BruteForceProtectionRepository> BruteForceProtectionService<R> {
             .get_attempt_stats(email, window_start)
             .await?;
 
-        self.compute_lockout_status(email, &stats)
+        self.compute_lockout_status(email, &stats).await
     }
 
     /// Check if an account is currently locked (convenience method).
@@ -156,6 +142,7 @@ impl<R: BruteForceProtectionRepository> BruteForceProtectionService<R> {
     /// The updated `LockoutStatus` after recording the attempt.
     pub async fn record_failed_attempt(
         &self,
+        transaction: &mut dyn TransactionAdapter,
         email: &str,
         ip_address: Option<&str>,
     ) -> Result<LockoutStatus, Error> {
@@ -169,39 +156,20 @@ impl<R: BruteForceProtectionRepository> BruteForceProtectionService<R> {
             });
         }
 
-        let was_locked = self.get_lockout_status(email).await?.is_locked;
-
         // Record the attempt
         self.repository
-            .record_failed_attempt(email, ip_address)
+            .record_failed_attempt(transaction, email, ip_address)
             .await?;
 
         // Get updated status
-        let status = self.get_lockout_status(email).await?;
+        let mut status = self.get_lockout_status(email).await?;
 
         // If just became locked, set the locked_at timestamp to protect against cleanup
-        if status.is_locked {
+        if status.failed_attempts >= self.config.max_failed_attempts {
             self.repository
-                .set_locked_at(email, Some(Utc::now()))
+                .set_locked_at(transaction, email, Some(Utc::now()))
                 .await?;
-        }
-
-        self.emit_event(Event::LoginFailed {
-            email: email.to_string(),
-            failed_attempts: status.failed_attempts,
-            ip_address: ip_address.map(str::to_string),
-            timestamp: Utc::now(),
-        })
-        .await?;
-        if !was_locked && status.is_locked {
-            self.emit_event(Event::AccountLocked {
-                email: email.to_string(),
-                failed_attempts: status.failed_attempts,
-                locked_until: status.locked_until.unwrap_or_else(Utc::now),
-                ip_address: ip_address.map(str::to_string),
-                timestamp: Utc::now(),
-            })
-            .await?;
+            status = self.get_lockout_status(email).await?;
         }
 
         Ok(status)
@@ -215,9 +183,15 @@ impl<R: BruteForceProtectionRepository> BruteForceProtectionService<R> {
     /// # Arguments
     ///
     /// * `email` - The email address to reset
-    pub async fn reset_attempts(&self, email: &str) -> Result<(), Error> {
-        self.repository.clear_attempts(email).await?;
-        self.repository.set_locked_at(email, None).await?;
+    pub async fn reset_attempts(
+        &self,
+        transaction: &mut dyn TransactionAdapter,
+        email: &str,
+    ) -> Result<(), Error> {
+        self.repository.clear_attempts(transaction, email).await?;
+        self.repository
+            .set_locked_at(transaction, email, None)
+            .await?;
         Ok(())
     }
 
@@ -233,18 +207,16 @@ impl<R: BruteForceProtectionRepository> BruteForceProtectionService<R> {
     /// # Returns
     ///
     /// `true` if the account was previously locked, `false` otherwise.
-    pub async fn unlock_account(&self, email: &str) -> Result<bool, Error> {
+    pub async fn unlock_account(
+        &self,
+        transaction: &mut dyn TransactionAdapter,
+        email: &str,
+    ) -> Result<bool, Error> {
         let was_locked = self.is_locked(email).await?;
-        self.repository.clear_attempts(email).await?;
-        self.repository.set_locked_at(email, None).await?;
-        if was_locked {
-            self.emit_event(Event::AccountUnlocked {
-                email: email.to_string(),
-                reason: UnlockReason::PasswordReset,
-                timestamp: Utc::now(),
-            })
+        self.repository.clear_attempts(transaction, email).await?;
+        self.repository
+            .set_locked_at(transaction, email, None)
             .await?;
-        }
         Ok(was_locked)
     }
 
@@ -304,7 +276,7 @@ impl<R: BruteForceProtectionRepository> BruteForceProtectionService<R> {
     }
 
     /// Compute lockout status from attempt statistics.
-    fn compute_lockout_status(
+    async fn compute_lockout_status(
         &self,
         email: &str,
         stats: &AttemptStats,
@@ -319,8 +291,12 @@ impl<R: BruteForceProtectionRepository> BruteForceProtectionService<R> {
             });
         }
 
-        // Calculate lockout expiry from the latest attempt
-        let locked_until = stats.latest_at.map(|t| t + self.config.lockout_period);
+        // Anchor lockout expiry to the persisted lock timestamp, not this read.
+        let locked_until = self
+            .repository
+            .get_locked_at(email)
+            .await?
+            .map(|locked_at| locked_at + self.config.lockout_duration);
         let is_locked = locked_until.is_some_and(|until| until > Utc::now());
 
         Ok(LockoutStatus {
@@ -332,20 +308,13 @@ impl<R: BruteForceProtectionRepository> BruteForceProtectionService<R> {
     }
 }
 
-#[async_trait::async_trait]
-impl<R: BruteForceProtectionRepository> EventEmitter for BruteForceProtectionService<R> {
-    fn event_bus(&self) -> Option<&Arc<EventBus>> {
-        self.event_bus.as_ref()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use async_trait::async_trait;
     use chrono::{DateTime, Duration};
     use std::sync::Mutex;
-    use torii_core::storage::FailedLoginAttempt;
+    use torii_core::{NoopTransactionAdapter, storage::FailedLoginAttempt};
 
     /// Mock repository for testing
     struct MockBruteForceRepository {
@@ -366,6 +335,7 @@ mod tests {
     impl BruteForceProtectionRepository for MockBruteForceRepository {
         async fn record_failed_attempt(
             &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
             email: &str,
             ip_address: Option<&str>,
         ) -> Result<FailedLoginAttempt, Error> {
@@ -397,7 +367,11 @@ mod tests {
             })
         }
 
-        async fn clear_attempts(&self, email: &str) -> Result<u64, Error> {
+        async fn clear_attempts(
+            &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
+            email: &str,
+        ) -> Result<u64, Error> {
             let mut attempts = self.attempts.lock().unwrap();
             let before_len = attempts.len();
             attempts.retain(|a| a.email != email);
@@ -420,6 +394,7 @@ mod tests {
 
         async fn set_locked_at(
             &self,
+            _transaction: &mut dyn torii_core::TransactionAdapter,
             _email: &str,
             locked_at: Option<DateTime<Utc>>,
         ) -> Result<(), Error> {
@@ -451,9 +426,10 @@ mod tests {
         let repo = Arc::new(MockBruteForceRepository::new());
         let config = BruteForceProtectionConfig::disabled();
         let service = BruteForceProtectionService::new(repo.clone(), config);
+        let mut transaction = NoopTransactionAdapter;
 
         let status = service
-            .record_failed_attempt("test@example.com", Some("127.0.0.1"))
+            .record_failed_attempt(&mut transaction, "test@example.com", Some("127.0.0.1"))
             .await
             .unwrap();
 
@@ -467,9 +443,10 @@ mod tests {
         let repo = Arc::new(MockBruteForceRepository::new());
         let config = BruteForceProtectionConfig::default();
         let service = BruteForceProtectionService::new(repo, config);
+        let mut transaction = NoopTransactionAdapter;
 
         let status = service
-            .record_failed_attempt("test@example.com", Some("127.0.0.1"))
+            .record_failed_attempt(&mut transaction, "test@example.com", Some("127.0.0.1"))
             .await
             .unwrap();
 
@@ -484,14 +461,16 @@ mod tests {
             enabled: true,
             max_failed_attempts: 3,
             lockout_period: Duration::minutes(15),
+            lockout_duration: Duration::minutes(15),
             retention_period: Duration::days(7),
         };
         let service = BruteForceProtectionService::new(repo, config);
+        let mut transaction = NoopTransactionAdapter;
 
         // Record 2 attempts - should not be locked
         for _ in 0..2 {
             let status = service
-                .record_failed_attempt("test@example.com", None)
+                .record_failed_attempt(&mut transaction, "test@example.com", None)
                 .await
                 .unwrap();
             assert!(!status.is_locked);
@@ -499,7 +478,7 @@ mod tests {
 
         // 3rd attempt should trigger lockout
         let status = service
-            .record_failed_attempt("test@example.com", None)
+            .record_failed_attempt(&mut transaction, "test@example.com", None)
             .await
             .unwrap();
         assert!(status.is_locked);
@@ -514,21 +493,26 @@ mod tests {
             enabled: true,
             max_failed_attempts: 2,
             lockout_period: Duration::minutes(15),
+            lockout_duration: Duration::minutes(15),
             retention_period: Duration::days(7),
         };
         let service = BruteForceProtectionService::new(repo, config);
+        let mut transaction = NoopTransactionAdapter;
 
         // Lock the account
         for _ in 0..2 {
             service
-                .record_failed_attempt("test@example.com", None)
+                .record_failed_attempt(&mut transaction, "test@example.com", None)
                 .await
                 .unwrap();
         }
         assert!(service.is_locked("test@example.com").await.unwrap());
 
         // Reset attempts
-        service.reset_attempts("test@example.com").await.unwrap();
+        service
+            .reset_attempts(&mut transaction, "test@example.com")
+            .await
+            .unwrap();
 
         // Should be unlocked now
         assert!(!service.is_locked("test@example.com").await.unwrap());
@@ -546,24 +530,32 @@ mod tests {
             enabled: true,
             max_failed_attempts: 2,
             lockout_period: Duration::minutes(15),
+            lockout_duration: Duration::minutes(15),
             retention_period: Duration::days(7),
         };
         let service = BruteForceProtectionService::new(repo, config);
+        let mut transaction = NoopTransactionAdapter;
 
         // Lock the account
         for _ in 0..2 {
             service
-                .record_failed_attempt("test@example.com", None)
+                .record_failed_attempt(&mut transaction, "test@example.com", None)
                 .await
                 .unwrap();
         }
 
         // Unlock should return true (was locked)
-        let was_locked = service.unlock_account("test@example.com").await.unwrap();
+        let was_locked = service
+            .unlock_account(&mut transaction, "test@example.com")
+            .await
+            .unwrap();
         assert!(was_locked);
 
         // Unlock again should return false (was not locked)
-        let was_locked = service.unlock_account("test@example.com").await.unwrap();
+        let was_locked = service
+            .unlock_account(&mut transaction, "test@example.com")
+            .await
+            .unwrap();
         assert!(!was_locked);
     }
 
@@ -574,12 +566,14 @@ mod tests {
             enabled: true,
             max_failed_attempts: 1,
             lockout_period: Duration::minutes(15),
+            lockout_duration: Duration::minutes(15),
             retention_period: Duration::days(7),
         };
         let service = BruteForceProtectionService::new(repo, config);
+        let mut transaction = NoopTransactionAdapter;
 
         let status = service
-            .record_failed_attempt("test@example.com", None)
+            .record_failed_attempt(&mut transaction, "test@example.com", None)
             .await
             .unwrap();
 
@@ -596,14 +590,16 @@ mod tests {
             enabled: true,
             max_failed_attempts: 2,
             lockout_period: Duration::minutes(15),
+            lockout_duration: Duration::minutes(15),
             retention_period: Duration::days(7),
         };
         let service = BruteForceProtectionService::new(repo, config);
+        let mut transaction = NoopTransactionAdapter;
 
         // Lock first account
         for _ in 0..2 {
             service
-                .record_failed_attempt("user1@example.com", None)
+                .record_failed_attempt(&mut transaction, "user1@example.com", None)
                 .await
                 .unwrap();
         }
@@ -625,9 +621,10 @@ mod tests {
         let repo = Arc::new(MockBruteForceRepository::new());
         let config = BruteForceProtectionConfig::default();
         let service = BruteForceProtectionService::new(repo.clone(), config);
+        let mut transaction = NoopTransactionAdapter;
 
         service
-            .record_failed_attempt("test@example.com", Some("192.168.1.100"))
+            .record_failed_attempt(&mut transaction, "test@example.com", Some("192.168.1.100"))
             .await
             .unwrap();
 

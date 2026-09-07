@@ -23,7 +23,11 @@ impl PostgresUserRepository {
 
 #[async_trait]
 impl UserRepository for PostgresUserRepository {
-    async fn create(&self, user: NewUser) -> Result<User, Error> {
+    async fn create(
+        &self,
+        _transaction: &mut dyn torii_core::TransactionAdapter,
+        user: NewUser,
+    ) -> Result<User, Error> {
         let pg_user = sqlx::query_as::<_, PostgresUser>(
             r#"
             INSERT INTO users (id, email, name, email_verified_at)
@@ -97,10 +101,15 @@ impl UserRepository for PostgresUserRepository {
         }
 
         let new_user = NewUser::new(email.to_string());
-        self.create(new_user).await
+        <Self as UserRepository>::create(self, &mut torii_core::NoopTransactionAdapter, new_user)
+            .await
     }
 
-    async fn update(&self, user: &User) -> Result<User, Error> {
+    async fn update(
+        &self,
+        _transaction: &mut dyn torii_core::TransactionAdapter,
+        user: &User,
+    ) -> Result<User, Error> {
         let pg_user = sqlx::query_as::<_, PostgresUser>(
             r#"
             UPDATE users
@@ -125,7 +134,11 @@ impl UserRepository for PostgresUserRepository {
         Ok(pg_user.into())
     }
 
-    async fn delete(&self, id: &UserId) -> Result<(), Error> {
+    async fn delete(
+        &self,
+        _transaction: &mut dyn torii_core::TransactionAdapter,
+        id: &UserId,
+    ) -> Result<(), Error> {
         sqlx::query("DELETE FROM users WHERE id = $1")
             .bind(id.as_str())
             .execute(&self.pool)
@@ -138,7 +151,11 @@ impl UserRepository for PostgresUserRepository {
         Ok(())
     }
 
-    async fn mark_email_verified(&self, user_id: &UserId) -> Result<(), Error> {
+    async fn mark_email_verified(
+        &self,
+        _transaction: &mut dyn torii_core::TransactionAdapter,
+        user_id: &UserId,
+    ) -> Result<(), Error> {
         let now = Utc::now();
         sqlx::query("UPDATE users SET email_verified_at = $1, updated_at = $2 WHERE id = $3")
             .bind(now)

@@ -1,4 +1,4 @@
-use crate::{Error, OAuthAccount, User, UserId};
+use crate::{Error, OAuthAccount, User, UserId, transaction::TransactionAdapter};
 use async_trait::async_trait;
 use chrono::Duration;
 
@@ -8,6 +8,7 @@ pub trait OAuthRepository: Send + Sync + 'static {
     /// Create a new OAuth account linked to a user
     async fn create_account(
         &self,
+        transaction: &mut dyn TransactionAdapter,
         provider: &str,
         subject: &str,
         user_id: &UserId,
@@ -33,17 +34,24 @@ pub trait OAuthRepository: Send + Sync + 'static {
     /// Link an existing user to an OAuth account
     async fn link_account(
         &self,
+        transaction: &mut dyn TransactionAdapter,
         user_id: &UserId,
         provider: &str,
         subject: &str,
     ) -> Result<(), Error>;
 
     /// Unlink an OAuth account from a user
-    async fn unlink_account(&self, user_id: &UserId, provider: &str) -> Result<(), Error>;
+    async fn unlink_account(
+        &self,
+        transaction: &mut dyn TransactionAdapter,
+        user_id: &UserId,
+        provider: &str,
+    ) -> Result<(), Error>;
 
     /// Store a PKCE verifier with an expiration time
     async fn store_pkce_verifier(
         &self,
+        transaction: &mut dyn TransactionAdapter,
         csrf_state: &str,
         pkce_verifier: &str,
         expires_in: Duration,
@@ -53,5 +61,9 @@ pub trait OAuthRepository: Send + Sync + 'static {
     async fn get_pkce_verifier(&self, csrf_state: &str) -> Result<Option<String>, Error>;
 
     /// Delete a PKCE verifier
-    async fn delete_pkce_verifier(&self, csrf_state: &str) -> Result<(), Error>;
+    async fn delete_pkce_verifier(
+        &self,
+        transaction: &mut dyn TransactionAdapter,
+        csrf_state: &str,
+    ) -> Result<(), Error>;
 }
